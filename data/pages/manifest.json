@@ -1,5 +1,5 @@
 {
-  "scraped_at": "2026-11-04T14:20:54+00:00",
+  "scraped_at": "2026-11-04T16:28:40+00:00",
   "seeds": [
     "https://www.ziggo.nl/",
     "https://www.ziggo.nl/internet",
@@ -9,5 +9,6 @@
     "https://www.ziggo.nl/mobiel"
   ],
   "max_depth": 2,
-  "pages": 78
+  "catalogue_url": "https://www.ziggo.nl/services/blueriq/b2c/info",
+  "pages": 79
 }
