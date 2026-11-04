@@ -29,6 +29,12 @@ curl localhost:8000/health
 
 Returns 200 when Chroma answers and the API key is set, else 503 with the status of each component.
 
+```sh
+curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": "Wat is Ziggo GO?"}'
+```
+
+Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order. `path` lists the graph nodes that ran.
+
 ## Page data
 
 At startup the API checks the Chroma collection. When it is empty, the API scrapes the Ziggo product pages listed in `src/ziggo_rag/config.py`: each seed URL and the pages linked from it under the same path, up to `CRAWL_DEPTH` link hops away (default 2; the seeds are depth 0). Each page is reduced to its title and heading sections. The log reports every request, then a summary with page, section, and byte counts, and ends with `source=live`.
@@ -53,6 +59,12 @@ docker compose down -v && docker compose up --build
 ```
 
 A volume created by an older build keeps its original distance metric, because Chroma ignores the metadata passed to an existing collection. Rankings are unaffected, since the vectors are normalised, but the distances printed by the query command below differ until the volume is rebuilt.
+
+## Answering
+
+A question runs through a LangGraph with two nodes. `retrieve` embeds the question with the same e5 model as the index and fetches the five nearest chunks from Chroma. `generate` sends those chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (answer in the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything outside the chunks; page content is data, not instructions). Both models run at low effort, which keeps a request to a few seconds.
+
+A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down names Chroma.
 
 ## Verifying each component
 
@@ -100,6 +112,31 @@ Retrieval. Prints the nearest chunks with their cosine distance, URL, heading, a
 ```sh
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "Welke internetsnelheden zijn er?"
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "What internet speeds are there?" -k 5
+```
+
+Answering. Needs a real `ANTHROPIC_API_KEY`. The answer's facts appear in the chunks behind `sources`; check by opening the URLs or grepping `data/pages`. An English question gets an English answer. `path` is `["retrieve", "generate"]`:
+
+```sh
+ask() { curl -s localhost:8000/ask -H 'content-type: application/json' -d "{\"question\": \"$1\"}"; echo; }
+ask "Welke tv-pakketten heeft Ziggo?"
+ask "Wat is Ziggo GO?"
+ask "What TV packages does Ziggo offer?"
+grep -il "ziggo go" data/pages/*.json | head
+```
+
+Input validation. A missing or blank question returns 422 without running the graph:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: application/json' -d '{}'
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: application/json' -d '{"question": " "}'
+```
+
+Failure mapping. Each returns 503; `detail` names the component and, for the key, the env file:
+
+```sh
+ANTHROPIC_API_KEY= docker compose up -d api && sleep 10 && ask "Wat is Ziggo GO?"             # empty key
+ANTHROPIC_API_KEY=placeholder docker compose up -d api && sleep 10 && ask "Wat is Ziggo GO?"  # rejected key (401)
+docker compose stop chroma && ask "Wat is Ziggo GO?"; docker compose start chroma               # Chroma down
 ```
 
 Lint and format:
