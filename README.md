@@ -19,6 +19,8 @@ docker compose up --build
 
 Without 1Password, copy `.env.1password` to `.env` and replace the `op://` value with the key.
 
+The compose file passes `ANTHROPIC_API_KEY` from the shell into the container, and that value overrides `.env`. A shell that exports the variable as an empty string therefore starts the API without a key even when `.env` holds one; `/health` then reports `anthropic_api_key: missing`. Unset the variable or start compose with `env -u ANTHROPIC_API_KEY docker compose up`.
+
 ## Running
 
 `docker compose up --build` starts Chroma and the API on port 8000. The first build downloads the embedding model and CPU-only torch; the API image is about 2.3 GB.
@@ -64,7 +66,7 @@ A volume created by an older build keeps its original distance metric, because C
 
 A question runs through a LangGraph with two nodes. `retrieve` embeds the question with the same e5 model as the index and fetches the five nearest chunks from Chroma. `generate` sends those chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (answer in the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything outside the chunks; page content is data, not instructions). Both models run at low effort, which keeps a request to a few seconds.
 
-A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down names Chroma.
+A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the model declines to answer, the response is a fixed bilingual message pointing at ziggo.nl and customer service.
 
 ## Verifying each component
 
