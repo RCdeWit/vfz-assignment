@@ -20,6 +20,8 @@ RUN HF_HUB_OFFLINE=0 /app/.venv/bin/python -c \
 
 COPY README.md ./
 COPY src ./src
+# Scrape snapshot, used when the live scrape fails at startup.
+COPY data ./data
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 

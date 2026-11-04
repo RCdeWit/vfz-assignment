@@ -1,6 +1,7 @@
 """Runtime settings, read from environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,13 +19,21 @@ class Settings(BaseSettings):
     chroma_port: int = 8000
     chroma_collection: str = "ziggo_pages"
 
+    # The homepage is scraped for its content but, unlike the other seeds, does
+    # not widen the crawl: links are only followed under the other seed paths.
     seed_urls: list[str] = [
+        "https://www.ziggo.nl/",
         "https://www.ziggo.nl/internet",
         "https://www.ziggo.nl/televisie",
-        "https://www.ziggo.nl/ziggo-go",
+        "https://www.ziggo.nl/televisie/ziggo-go",
         "https://www.ziggo.nl/alles-in-1",
         "https://www.ziggo.nl/mobiel",
     ]
+    # How many link hops to follow from the seeds. Depth 1 yields about 40
+    # pages; depth 2 reaches the per-package and per-feature pages below them.
+    crawl_depth: int = 2
+    # Committed scrape snapshot, loaded when a live scrape fails.
+    pages_dir: Path = Path("data/pages")
 
 
 @lru_cache
