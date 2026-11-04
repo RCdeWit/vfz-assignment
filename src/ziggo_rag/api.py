@@ -42,7 +42,8 @@ from ziggo_rag.ingest import (
     is_ingested,
 )
 from ziggo_rag.llm import embedding_model
-from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
+from ziggo_rag.pages import Page, ScrapeError
+from ziggo_rag.scrape import load_snapshot, read_manifest, scrape_pages
 
 log = logging.getLogger("ziggo_rag")
 

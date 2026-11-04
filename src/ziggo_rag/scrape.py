@@ -26,23 +26,18 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Tag
 from bs4.element import NavigableString, TemplateString
 
+from ziggo_rag.catalogue import fetch_catalogue
 from ziggo_rag.config import settings
+from ziggo_rag.pages import TIMEOUT_S, USER_AGENT, Page, ScrapeError, Section
 
 log = logging.getLogger("ziggo_rag.scrape")
 
-# ziggo.nl answers a 403 to the default httpx User-Agent.
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-)
-TIMEOUT_S = 10.0
 DELAY_S = 1.0
 # Shorter sections are icon captions and button labels ("Meer info").
 MIN_SECTION_CHARS = 40
@@ -54,21 +49,6 @@ HEADING_TAGS = ("h1", "h2", "h3")
 TEXT_TAGS = ("p", "li", "td", "th")
 # Exact types, so Comment, Script, and Stylesheet strings stay excluded.
 TEXT_TYPES = (NavigableString, TemplateString)
-
-
-class Section(TypedDict):
-    heading: str
-    text: str
-
-
-class Page(TypedDict):
-    url: str
-    title: str
-    sections: list[Section]
-
-
-class ScrapeError(Exception):
-    """Raised when a seed URL cannot be fetched: non-200 status, timeout, or no connection."""
 
 
 class _FetchFailed(Exception):
@@ -396,9 +376,6 @@ def main() -> int:
         "seeds": s.seed_urls,
         "max_depth": depth,
     }
-    # Imported here: catalogue imports this module for the shared types.
-    from ziggo_rag.catalogue import fetch_catalogue
-
     manifest["catalogue_url"] = s.catalogue_url
     try:
         pages = scrape_pages(s.seed_urls, max_depth=depth)

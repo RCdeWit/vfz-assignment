@@ -25,7 +25,7 @@ import sys
 import httpx
 
 from ziggo_rag.config import settings
-from ziggo_rag.scrape import TIMEOUT_S, USER_AGENT, Page, ScrapeError, Section
+from ziggo_rag.pages import TIMEOUT_S, USER_AGENT, Page, ScrapeError, Section
 
 log = logging.getLogger("ziggo_rag.catalogue")
 
