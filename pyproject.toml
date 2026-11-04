@@ -1,0 +1,37 @@
+[project]
+name = "ziggo-rag"
+version = "0.1.0"
+description = "RAG assistant over Ziggo product pages: FastAPI, LangGraph, Chroma, Anthropic."
+readme = "README.md"
+authors = [
+    { name = "RCdeWit", email = "RCdeWit@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "chromadb>=1.5.9",
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "langchain-anthropic>=1.7.9",
+    "langchain-core>=1.7.4",
+    "langgraph>=1.2.19",
+    "pydantic-settings>=2.16.2",
+    "sentence-transformers>=6.2.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
