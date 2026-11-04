@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     grade_model: str = "claude-haiku-5-5"
 
     embedding_model: str = "intfloat/multilingual-e5-small"
+    # Seconds a request to /ask may take in total. Each model call gets the
+    # time left as its own timeout, so a hung Anthropic connection returns a
+    # 504 at this limit instead of holding the request for several calls.
+    request_timeout: float = 30.0
 
     chroma_host: str = "localhost"
     chroma_port: int = 8000
