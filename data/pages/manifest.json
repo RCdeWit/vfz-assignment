@@ -1,0 +1,12 @@
+{
+  "scraped_at": "2026-11-04T11:10:18+00:00",
+  "seeds": [
+    "https://www.ziggo.nl/internet",
+    "https://www.ziggo.nl/televisie",
+    "https://www.ziggo.nl/televisie/ziggo-go",
+    "https://www.ziggo.nl/alles-in-1",
+    "https://www.ziggo.nl/mobiel"
+  ],
+  "max_depth": 2,
+  "pages": 77
+}
