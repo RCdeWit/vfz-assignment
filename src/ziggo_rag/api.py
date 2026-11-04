@@ -59,7 +59,7 @@ def load_pages() -> list[Page]:
     """
     s = settings()
     try:
-        pages = scrape_pages(s.seed_urls)
+        pages = scrape_pages(s.seed_urls, max_depth=s.crawl_depth)
         source = "live"
     except ScrapeError as e:
         log.warning("live scrape failed: %s", e)

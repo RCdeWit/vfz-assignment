@@ -1,9 +1,10 @@
 """Bounded crawl of ziggo.nl product pages, cleaned into heading sections.
 
-The crawl fetches each seed URL, follows links whose path sits under one of the
-seed paths (depth 1), and stops. Each fetched page becomes one record:
-``{"url", "title", "sections": [{"heading", "text"}]}``. Run the module
-directly to write those records to ``data/pages/`` as the committed snapshot.
+The crawl fetches each seed URL and follows links whose path sits under one
+of the seed paths, up to a maximum depth (the seeds are depth 0). Each fetched
+page becomes one record: ``{"url", "title", "sections": [{"heading", "text"}]}``.
+Run the module directly to write those records to ``data/pages/`` as the
+committed snapshot; ``--depth`` overrides the configured depth.
 
 ziggo.nl renders most product detail (package names, speeds, prices) through
 client-side templates. The server response carries that text inside
@@ -13,6 +14,7 @@ that still contain an unrendered placeholder such as ``{{ vmpc.getPrice(2.5) }}`
 are dropped.
 """
 
+import argparse
 import json
 import logging
 import re
@@ -91,11 +93,13 @@ class Stats:
         return time.perf_counter() - self.started
 
 
-def scrape_pages(seeds: list[str]) -> list[Page]:
-    """Crawl the seeds to depth 1 and return one cleaned Page per unique URL.
+def scrape_pages(seeds: list[str], max_depth: int = 1) -> list[Page]:
+    """Crawl the seeds to max_depth and return one cleaned Page per unique URL.
 
-    Raises ScrapeError when any seed fetch fails. Depth-1 pages that fail are
-    logged and skipped. Logs every request and a summary with counts at the end.
+    Links are collected from pages at depths below max_depth; pages at
+    max_depth are cleaned but not followed. Raises ScrapeError when any seed
+    fetch fails. Deeper pages that fail are logged and skipped. Logs every
+    request and a summary with counts per depth at the end.
     """
     stats = Stats()
     prefixes = [urlsplit(normalize_url(s)).path for s in seeds]
@@ -103,7 +107,9 @@ def scrape_pages(seeds: list[str]) -> list[Page]:
     seen: set[str] = {url for url, _ in queue}
     pages: dict[str, Page] = {}
 
-    log.info("starting crawl: %d seeds, path prefixes %s", len(seeds), prefixes)
+    log.info(
+        "starting crawl: %d seeds, max depth %d, path prefixes %s", len(seeds), max_depth, prefixes
+    )
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "nl-NL,nl;q=0.9"}
     with httpx.Client(headers=headers, timeout=TIMEOUT_S, follow_redirects=True) as client:
         # The queue grows while iterating; index access reads appended entries.
@@ -135,11 +141,11 @@ def scrape_pages(seeds: list[str]) -> list[Page]:
                 continue
 
             soup = BeautifulSoup(html, "html.parser")
-            if depth == 0:
+            if depth < max_depth:
                 links = in_scope_links(soup, final_url, prefixes)
                 new = [link for link in links if link not in seen]
                 seen.update(new)
-                queue.extend((link, 1) for link in new)
+                queue.extend((link, depth + 1) for link in new)
                 log.info("found %d in-scope links, %d new queued", len(links), len(new))
 
             page = clean_page(final_url, soup)
@@ -344,12 +350,21 @@ def snapshot_name(url: str) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Scrape the seed URLs and write data/pages/.")
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="link-following depth, seeds are depth 0 (default: CRAWL_DEPTH setting)",
+    )
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # httpx logs every request at INFO; fetch already logs each one with status and size.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     s = settings()
+    depth = s.crawl_depth if args.depth is None else args.depth
     try:
-        pages = scrape_pages(s.seed_urls)
+        pages = scrape_pages(s.seed_urls, max_depth=depth)
     except ScrapeError as e:
         log.error("scrape failed: %s", e)
         return 1

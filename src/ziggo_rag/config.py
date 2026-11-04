@@ -27,6 +27,9 @@ class Settings(BaseSettings):
         "https://www.ziggo.nl/alles-in-1",
         "https://www.ziggo.nl/mobiel",
     ]
+    # How many link hops to follow from the seeds. Depth 1 yields about 40
+    # pages; depth 2 reaches the per-package and per-feature pages below them.
+    crawl_depth: int = 2
     # Committed scrape snapshot, loaded when a live scrape fails.
     pages_dir: Path = Path("data/pages")
 
