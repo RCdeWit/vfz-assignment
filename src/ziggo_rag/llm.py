@@ -33,7 +33,8 @@ def embed_queries(texts: list[str]) -> list[list[float]]:
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    vectors = embedding_model().encode(texts, normalize_embeddings=True)
+    # The tqdm progress bar writes carriage-return lines into the container log.
+    vectors = embedding_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
     return vectors.tolist()
 
 
