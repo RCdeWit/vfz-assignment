@@ -5,7 +5,9 @@ of the seed paths, up to a maximum depth (the seeds are depth 0). Each fetched
 page becomes one record: ``{"url", "title", "sections": [{"heading", "text"}]}``.
 Run the module directly to write those records to ``data/pages/`` as the
 committed snapshot, with a ``manifest.json`` recording the crawl time and
-parameters; ``--depth`` overrides the configured depth.
+parameters; ``--depth`` overrides the configured depth. The snapshot also
+holds the catalogue page from ``catalogue.py``, which carries the
+subscription prices the product pages do not render.
 
 ziggo.nl renders most product detail (package names, speeds, prices) through
 client-side templates. The server response carries that text inside
@@ -394,8 +396,13 @@ def main() -> int:
         "seeds": s.seed_urls,
         "max_depth": depth,
     }
+    # Imported here: catalogue imports this module for the shared types.
+    from ziggo_rag.catalogue import fetch_catalogue
+
+    manifest["catalogue_url"] = s.catalogue_url
     try:
         pages = scrape_pages(s.seed_urls, max_depth=depth)
+        pages.append(fetch_catalogue())
     except ScrapeError as e:
         log.error("scrape failed: %s", e)
         return 1

@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StringConstraints
 
+from ziggo_rag.catalogue import fetch_catalogue
 from ziggo_rag.config import settings
 from ziggo_rag.graph import ComponentError, State, graph, initial_state
 from ziggo_rag.ingest import (
@@ -95,15 +96,17 @@ def startup_collection() -> Collection | None:
 
 
 def load_pages() -> list[Page]:
-    """Scrape the seed URLs, or load the committed snapshot when a seed fetch fails.
+    """Scrape the seed URLs and the price catalogue, or load the committed snapshot.
 
-    Logs ``source=live`` or ``source=snapshot`` so a run can be checked for
-    which path it took; the snapshot line includes the crawl date from its
-    manifest.
+    The snapshot is used when a seed fetch or the catalogue fetch fails, so
+    the index never mixes live pages with snapshot prices. Logs
+    ``source=live`` or ``source=snapshot`` so a run can be checked for which
+    path it took; the snapshot line includes the crawl date from its manifest.
     """
     s = settings()
     try:
         pages = scrape_pages(s.seed_urls, max_depth=s.crawl_depth)
+        pages.append(fetch_catalogue())
         log.info("pages loaded source=live count=%d", len(pages))
     except ScrapeError as e:
         log.warning("live scrape failed: %s", e)
