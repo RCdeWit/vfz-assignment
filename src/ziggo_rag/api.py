@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StringConstraints
 
 from ziggo_rag.config import settings
-from ziggo_rag.graph import ComponentError, graph, initial_state
+from ziggo_rag.graph import ComponentError, State, graph, initial_state
 from ziggo_rag.ingest import (
     INGESTED_AT_KEY,
     chroma_client,
@@ -143,16 +143,20 @@ def ask(body: AskRequest) -> AskResponse:
     Runs the graph once and returns the answer, the pages the answer was
     written from, and the nodes visited. A failing backing service returns
     503 with the component name and, for a missing or rejected API key, the
-    env file to fix.
+    env file to fix. A rate limit from Anthropic returns 429 with its
+    Retry-After header when it sent one.
     """
     try:
         state = graph.invoke(initial_state(body.question))
     except ComponentError as e:
-        raise HTTPException(status_code=503, detail=f"{e.component}: {e}") from e
+        headers = {"Retry-After": e.retry_after} if e.retry_after else None
+        raise HTTPException(
+            status_code=e.status_code, detail=f"{e.component}: {e}", headers=headers
+        ) from e
     return AskResponse(answer=state["answer"], sources=sources(state), path=state["path"])
 
 
-def sources(state: dict) -> list[Source]:
+def sources(state: State) -> list[Source]:
     """List the distinct pages and headings behind the retrieved chunks, in rank order.
 
     Parts of one split section share a URL and heading and collapse to one
