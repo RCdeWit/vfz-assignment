@@ -51,3 +51,57 @@ Chunk ids are a hash of the page URL, heading, and part number, so ingesting the
 ```sh
 docker compose down -v && docker compose up --build
 ```
+
+## Verifying each component
+
+The commands below run against the compose stack. Commands prefixed with `docker compose exec api` run inside the API container, which has the embedding model and can reach Chroma; the same modules run on the host with `uv run python -m ...` when `CHROMA_HOST` and `CHROMA_PORT` point at a reachable Chroma.
+
+Health. Expect 200 with `chroma: ok` and a non-zero `collection_count`; 503 when Chroma is down or the key is missing:
+
+```sh
+curl -s localhost:8000/health
+```
+
+Startup path. The log shows whether the pages came from the live site or the snapshot, and how many chunks were ingested:
+
+```sh
+docker compose logs api | grep -E "source=|collection .* holds|ingested .* from"
+```
+
+Restart. A second start finds the collection filled and skips scrape and ingest; the log shows `collection ziggo_pages holds N chunks` and no `source=` line:
+
+```sh
+docker compose restart api && docker compose logs --since 1m api | grep -E "source=|holds"
+```
+
+Scrape. Refresh the snapshot and inspect one page file; each file has a title and a list of heading sections:
+
+```sh
+uv run python -m ziggo_rag.scrape
+python3 -m json.tool data/pages/internet.json | head -40
+```
+
+Chunking. Chunks the snapshot without touching Chroma and prints counts and sizes. `unique_ids` equals `chunks`, and `max_chars` stays under about 1600:
+
+```sh
+uv run python -m ziggo_rag.ingest
+```
+
+Ingest idempotence. Upserts the snapshot chunks and prints the collection count before and after. Running it against a filled collection leaves the count unchanged:
+
+```sh
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --ingest
+```
+
+Retrieval. Prints the nearest chunks with their cosine distance, URL, heading, and part. A Dutch and an English phrasing of the same question return the same pages:
+
+```sh
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "Welke internetsnelheden zijn er?"
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "What internet speeds are there?" -k 5
+```
+
+Lint and format:
+
+```sh
+uv run ruff check . && uv run ruff format --check .
+```
