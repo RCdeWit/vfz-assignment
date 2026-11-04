@@ -3,23 +3,23 @@
 import logging
 from contextlib import asynccontextmanager
 
-import chromadb
 from chromadb.api.models.Collection import Collection
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from ziggo_rag.config import settings
-from ziggo_rag.ingest import INGESTED_AT_KEY, chunk_pages, get_collection, ingest, is_ingested
+from ziggo_rag.ingest import (
+    INGESTED_AT_KEY,
+    chroma_client,
+    chunk_pages,
+    get_collection,
+    ingest,
+    is_ingested,
+)
 from ziggo_rag.llm import embedding_model
 from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
 
 log = logging.getLogger("ziggo_rag")
-
-
-def chroma_client() -> chromadb.ClientAPI:
-    """Connect to the Chroma service named in the settings."""
-    s = settings()
-    return chromadb.HttpClient(host=s.chroma_host, port=s.chroma_port)
 
 
 @asynccontextmanager

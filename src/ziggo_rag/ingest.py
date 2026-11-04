@@ -57,6 +57,12 @@ class Chunk(TypedDict):
     metadata: ChunkMetadata
 
 
+def chroma_client() -> chromadb.ClientAPI:
+    """Connect to the Chroma service named in the settings."""
+    s = settings()
+    return chromadb.HttpClient(host=s.chroma_host, port=s.chroma_port)
+
+
 def get_collection(client: chromadb.ClientAPI) -> Collection:
     """Return the configured collection, creating it with cosine distance if missing.
 
@@ -189,8 +195,7 @@ def main() -> int:
             f"median_chars={lengths[len(lengths) // 2]} max_chars={lengths[-1]}"
         )
     if args.ingest or args.query is not None:
-        client = chromadb.HttpClient(host=s.chroma_host, port=s.chroma_port)
-        collection = get_collection(client)
+        collection = get_collection(chroma_client())
     if args.ingest:
         print(f"count before={collection.count()}")
         ingest(chunks, collection)
