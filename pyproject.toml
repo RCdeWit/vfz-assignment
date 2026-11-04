@@ -17,6 +17,7 @@ dependencies = [
     "langgraph>=1.2.19",
     "pydantic-settings>=2.16.2",
     "sentence-transformers>=6.2.0",
+    "torch>=2.15.0",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -35,3 +36,14 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+# CPU-only torch for the Linux image. The default PyPI wheel bundles CUDA
+# libraries, which add several GB to the image for no benefit on Fargate or a
+# laptop container. macOS wheels on PyPI are already CPU-only.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
