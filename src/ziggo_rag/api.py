@@ -37,9 +37,10 @@ async def lifespan(app: FastAPI):
             pages = load_pages()
             count = ingest(chunk_pages(pages), collection)
             log.info("ingested %d chunks from %d pages", count, len(pages))
-        except Exception as e:  # any failure here must not stop the server
-            # The server still comes up so /health can report the state. The
-            # completion marker is missing, so the next start retries.
+        except Exception as e:
+            # Logged, not raised: the server starts without a usable index so
+            # /health can show the collection count. The ingested_at stamp was
+            # not written, so the next start runs scrape and ingest again.
             log.error("startup ingest failed, index incomplete: %s", e)
     yield
 
