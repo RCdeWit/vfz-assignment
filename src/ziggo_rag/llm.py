@@ -41,18 +41,22 @@ def _embed(texts: list[str]) -> list[list[float]]:
 
 def generate_model() -> ChatAnthropic:
     """Return the chat model that writes customer-facing answers."""
-    return _chat(settings().generate_model, temperature=0.2)
+    return _chat(settings().generate_model)
 
 
 def grade_model() -> ChatAnthropic:
     """Return the chat model for retrieval grading and query rewriting."""
-    return _chat(settings().grade_model, temperature=0.0)
+    return _chat(settings().grade_model)
 
 
-def _chat(model: str, temperature: float) -> ChatAnthropic:
+def _chat(model: str) -> ChatAnthropic:
+    # Claude 5.5 models reject a non-default temperature with a 400 and always
+    # run adaptive thinking, so output variation and depth are controlled with
+    # effort instead. Low effort suits these calls: the answer is a few
+    # sentences composed from supplied context, and grading is a yes or no.
     return ChatAnthropic(
         model=model,
-        temperature=temperature,
         max_tokens=1024,
+        effort="low",
         api_key=settings().anthropic_api_key or None,
     )
