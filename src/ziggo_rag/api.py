@@ -1,4 +1,4 @@
-"""HTTP API: health check, startup page loading, and, in later phases, the /ask endpoint."""
+"""HTTP API: health check, startup scrape and ingest, and, in later phases, the /ask endpoint."""
 
 import logging
 from contextlib import asynccontextmanager
@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from ziggo_rag.config import settings
+from ziggo_rag.ingest import chunk_pages, get_collection, ingest
 from ziggo_rag.llm import embedding_model
 from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
 
@@ -31,7 +32,9 @@ async def lifespan(app: FastAPI):
     log.info("embedding model loaded")
     if collection_is_empty():
         pages = load_pages()
-        log.info("%d pages ready for ingest", len(pages))
+        chunks = chunk_pages(pages)
+        count = ingest(chunks, get_collection(chroma_client()))
+        log.info("ingested %d chunks from %d pages", count, len(pages))
     yield
 
 
@@ -43,7 +46,7 @@ def collection_is_empty() -> bool:
     """
     s = settings()
     try:
-        count = chroma_client().get_or_create_collection(s.chroma_collection).count()
+        count = get_collection(chroma_client()).count()
     except Exception as e:  # chromadb raises several unrelated types on connection failure
         log.warning("chroma unreachable at startup, skipping scrape: %s", e)
         return False
@@ -90,7 +93,7 @@ def health() -> JSONResponse:
         client = chroma_client()
         client.heartbeat()
         status["chroma"] = "ok"
-        status["collection_count"] = client.get_or_create_collection(s.chroma_collection).count()
+        status["collection_count"] = get_collection(client).count()
     except Exception as e:  # chromadb raises several unrelated types on connection failure
         log.warning("chroma health check failed: %s", e)
 
