@@ -4,7 +4,8 @@ The crawl fetches each seed URL and follows links whose path sits under one
 of the seed paths, up to a maximum depth (the seeds are depth 0). Each fetched
 page becomes one record: ``{"url", "title", "sections": [{"heading", "text"}]}``.
 Run the module directly to write those records to ``data/pages/`` as the
-committed snapshot; ``--depth`` overrides the configured depth.
+committed snapshot, with a ``manifest.json`` recording the crawl time and
+parameters; ``--depth`` overrides the configured depth.
 
 ziggo.nl renders most product detail (package names, speeds, prices) through
 client-side templates. The server response carries that text inside
@@ -21,6 +22,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -42,6 +44,7 @@ TIMEOUT_S = 10.0
 DELAY_S = 1.0
 # Shorter sections are icon captions and button labels ("Meer info").
 MIN_SECTION_CHARS = 40
+MANIFEST_NAME = "manifest.json"
 
 DROP_TAGS = ["nav", "footer", "header", "script", "style", "noscript"]
 DROP_ATTR = re.compile(r"cookie|consent|banner|modal", re.I)
@@ -322,25 +325,40 @@ def log_summary(stats: Stats) -> None:
     )
 
 
-def write_snapshot(pages: list[Page], directory: Path) -> list[Path]:
-    """Write one JSON file per page into directory, replacing earlier page files."""
+def write_snapshot(pages: list[Page], directory: Path, manifest: dict[str, object]) -> list[Path]:
+    """Write one JSON file per page plus manifest.json, replacing earlier files.
+
+    The manifest holds the crawl time and parameters in one file so a refresh
+    changes only the pages whose content changed.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.glob("*.json"):
         old.unlink()
     written = []
     for page in sorted(pages, key=lambda p: p["url"]):
         path = directory / f"{snapshot_name(page['url'])}.json"
-        path.write_text(json.dumps(page, ensure_ascii=False, indent=2) + "\n")
+        _write_json(path, page)
         written.append(path)
+    _write_json(directory / MANIFEST_NAME, {**manifest, "pages": len(pages)})
     return written
 
 
 def load_snapshot(directory: Path) -> list[Page]:
     """Read the page files written by write_snapshot. Raises FileNotFoundError when none exist."""
-    files = sorted(directory.glob("*.json"))
+    files = sorted(f for f in directory.glob("*.json") if f.name != MANIFEST_NAME)
     if not files:
         raise FileNotFoundError(f"no page files in {directory}")
     return [json.loads(f.read_text()) for f in files]
+
+
+def read_manifest(directory: Path) -> dict[str, object]:
+    """Return the snapshot manifest, or an empty dict when the snapshot has none."""
+    path = directory / MANIFEST_NAME
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _write_json(path: Path, data: object) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 def snapshot_name(url: str) -> str:
@@ -363,12 +381,17 @@ def main() -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     s = settings()
     depth = s.crawl_depth if args.depth is None else args.depth
+    manifest = {
+        "scraped_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "seeds": s.seed_urls,
+        "max_depth": depth,
+    }
     try:
         pages = scrape_pages(s.seed_urls, max_depth=depth)
     except ScrapeError as e:
         log.error("scrape failed: %s", e)
         return 1
-    written = write_snapshot(pages, s.pages_dir)
+    written = write_snapshot(pages, s.pages_dir, manifest)
     size = sum(p.stat().st_size for p in written)
     log.info("wrote %d page files (%.1f KB) to %s", len(written), size / 1024, s.pages_dir)
     return 0

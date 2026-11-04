@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from ziggo_rag.config import settings
 from ziggo_rag.llm import embedding_model
-from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, scrape_pages
+from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
 
 log = logging.getLogger("ziggo_rag")
 
@@ -55,17 +55,18 @@ def load_pages() -> list[Page]:
     """Scrape the seed URLs, or load the committed snapshot when a seed fetch fails.
 
     Logs ``source=live`` or ``source=snapshot`` so a run can be checked for
-    which path it took.
+    which path it took; the snapshot line includes the crawl date from its
+    manifest.
     """
     s = settings()
     try:
         pages = scrape_pages(s.seed_urls, max_depth=s.crawl_depth)
-        source = "live"
+        log.info("pages loaded source=live count=%d", len(pages))
     except ScrapeError as e:
         log.warning("live scrape failed: %s", e)
         pages = load_snapshot(s.pages_dir)
-        source = "snapshot"
-    log.info("pages loaded source=%s count=%d", source, len(pages))
+        scraped_at = read_manifest(s.pages_dir).get("scraped_at", "unknown")
+        log.info("pages loaded source=snapshot count=%d scraped_at=%s", len(pages), scraped_at)
     return pages
 
 
