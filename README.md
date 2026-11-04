@@ -142,15 +142,27 @@ Each component has a managed equivalent on AWS; the table gives one per componen
 
 ```mermaid
 flowchart LR
-    client([client]) --> waf["WAF"] --> alb["ALB"] --> ecs["ECS Fargate service: API tasks"]
-    ecs -- "VPC endpoint" --> bedrock["Bedrock: Claude Sonnet and Haiku"]
-    ecs -- "VPC endpoint" --> embed["Bedrock: embedding model"]
-    ecs -- "VPC endpoint" --> aoss[("OpenSearch Serverless vector collection")]
-    schedule["EventBridge schedule"] --> ingest["ECS task: scrape, embed, upsert"]
-    ingest -. fetch .-> ziggo["ziggo.nl"]
-    ingest --> s3[("S3 page snapshot")]
-    ingest --> embed
-    ingest --> aoss
+    client([client]) --> waf["WAF"] --> alb
+    subgraph vpc["VPC"]
+        subgraph public["public subnets"]
+            alb["ALB"]
+            nat["NAT gateway"]
+        end
+        subgraph private["private subnets"]
+            api1["API task 1"]
+            api2["API task 2"]
+            apiN["API task n, autoscaled"]
+            ingest["ingest task, scheduled"]
+        end
+        ep["VPC endpoints"]
+    end
+    alb --> api1 & api2 & apiN
+    api1 & api2 & apiN & ingest --> ep
+    ingest --> nat -.-> ziggo["ziggo.nl"]
+    ep --> bedrock["Bedrock: Claude models and embeddings"]
+    ep --> aoss[("OpenSearch Serverless vector collection")]
+    ep --> s3[("S3 page snapshot")]
+    schedule["EventBridge schedule"] --> ingest
 ```
 
 | Local | AWS |
