@@ -1,25 +1,10 @@
 """Model access: Anthropic chat model factories and the local embedding model.
 
-Embeddings are computed locally with ``intfloat/multilingual-e5-small``.
-Anthropic has no embedding endpoint, so the choice was between a second hosted
-API and a local model.
-
-- Quality. e5 is trained on about 100 languages, so a Dutch page and an
-  English question land near each other: the retrieval check in the README
-  returns the same pages for a Dutch and an English phrasing. The small
-  variant (384 dimensions) scores below e5-base and e5-large on retrieval
-  benchmarks; on this corpus of a few hundred section-level chunks, each
-  prefixed with its page title and heading, it retrieves the right pages for
-  the example questions.
-- Cost. No per-token fee and no second account, so the reviewer needs one
-  key.
-- Latency. On the CPU of the API container a query embeds in about 40 ms
-  and passages at about 25 chunks per second, so the index builds in half a
-  minute at startup. The larger e5 variants are several times slower without
-  a GPU.
-- Ease of use. One dependency, sentence-transformers, and a 470 MB model
-  downloaded at image build, so startup needs no network for it. The cost is
-  image size: torch adds about 1.7 GB.
+Embeddings are computed in this process with ``intfloat/multilingual-e5-small``
+through sentence-transformers; the README's design choices section gives the
+reasons for the model. The e5 models expect a ``query: `` or ``passage: ``
+prefix, added here, and the vectors are normalised so cosine distance and dot
+product rank identically.
 """
 
 from functools import lru_cache

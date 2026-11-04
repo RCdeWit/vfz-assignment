@@ -9,22 +9,7 @@ Vectors are computed here with the e5 model from ``llm.py`` and passed to
 Chroma explicitly. Chroma's own default embedding function (all-MiniLM-L6-v2,
 English only) is never used, so queries and passages share one model.
 
-Chroma is the vector store. It runs as a separate compose service, which the
-assignment requires, so an in-process index such as FAISS was not an option.
-
-- Quality. Cosine search over an HNSW index. On this collection of under a
-  thousand vectors the top five from Chroma matched a brute-force scan on
-  every query tried, so the approximate index costs no recall. Metadata is
-  stored next to each vector, which gives the API its source citations
-  without a second store.
-- Cost. Open source, one container, the index on a compose volume. No
-  managed service fee.
-- Latency. A top-5 query takes about 2 ms over the compose network, far
-  below the embedding and model calls around it.
-- Ease of use. One image, an HTTP API, a Python client in the same package,
-  and no schema: a collection is created with one call and accepts any flat
-  metadata dict. pgvector would need a Postgres schema and OpenSearch a
-  heavier node for the same result at this size.
+The README's design choices section gives the reasons for Chroma.
 
 Run the module directly to check the pipeline by hand. Without arguments it
 chunks the committed snapshot and prints size statistics. ``--ingest`` upserts
