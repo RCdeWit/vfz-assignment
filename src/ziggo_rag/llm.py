@@ -39,17 +39,22 @@ def _embed(texts: list[str]) -> list[list[float]]:
     return vectors.tolist()
 
 
+@lru_cache
 def generate_model() -> ChatAnthropic:
-    """Return the chat model that writes customer-facing answers."""
+    """Return the chat model that writes customer-facing answers, built once per process."""
     return _chat(settings().generate_model)
 
 
+@lru_cache
 def grade_model() -> ChatAnthropic:
-    """Return the chat model for retrieval grading and query rewriting."""
+    """Return the chat model for grading and query rewriting, built once per process."""
     return _chat(settings().grade_model)
 
 
 def _chat(model: str) -> ChatAnthropic:
+    # One attempt plus one retry within about a minute. The SDK default is a
+    # ten minute timeout with two retries, which would hold a request thread
+    # for half an hour on a hung connection.
     # Claude 5.5 models reject a non-default temperature with a 400 and always
     # run adaptive thinking, so output variation and depth are controlled with
     # effort instead. Low effort suits these calls: the answer is a few
@@ -58,5 +63,7 @@ def _chat(model: str) -> ChatAnthropic:
         model=model,
         max_tokens=1024,
         effort="low",
+        default_request_timeout=30.0,
+        max_retries=1,
         api_key=settings().anthropic_api_key or None,
     )
