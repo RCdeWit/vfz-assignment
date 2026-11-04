@@ -28,3 +28,13 @@ curl localhost:8000/health
 ```
 
 Returns 200 when Chroma answers and the API key is set, else 503 with the status of each component.
+
+## Page data
+
+At startup the API checks the Chroma collection. When it is empty, the API scrapes the Ziggo product pages listed in `src/ziggo_rag/config.py`: each seed URL and the pages linked from it under the same path, one level deep. Each page is reduced to its title and heading sections. The log reports every request, then a summary with page, section, and byte counts, and ends with `source=live`.
+
+ziggo.nl sits behind bot protection, so a seed fetch can fail with a non-200 status or a timeout. The API then loads the committed snapshot in `data/pages/` and logs `source=snapshot` with the failing seed. Refresh the snapshot with:
+
+```sh
+uv run python -m ziggo_rag.scrape
+```
