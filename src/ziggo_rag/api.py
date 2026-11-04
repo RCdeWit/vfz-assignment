@@ -1,32 +1,37 @@
-"""HTTP API: health check, startup scrape and ingest, and, in later phases, the /ask endpoint."""
+"""HTTP API: POST /ask, GET /health, and startup scrape and ingest."""
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-import chromadb
 from chromadb.api.models.Collection import Collection
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StringConstraints
 
 from ziggo_rag.config import settings
-from ziggo_rag.ingest import INGESTED_AT_KEY, chunk_pages, get_collection, ingest, is_ingested
+from ziggo_rag.graph import ComponentError, State, graph, initial_state
+from ziggo_rag.ingest import (
+    INGESTED_AT_KEY,
+    chroma_client,
+    chunk_pages,
+    get_collection,
+    ingest,
+    is_ingested,
+)
 from ziggo_rag.llm import embedding_model
 from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
 
 log = logging.getLogger("ziggo_rag")
 
 
-def chroma_client() -> chromadb.ClientAPI:
-    """Connect to the Chroma service named in the settings."""
-    s = settings()
-    return chromadb.HttpClient(host=s.chroma_host, port=s.chroma_port)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    # httpx logs every Chroma request at INFO, which drowns out the startup log.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # httpx logs every Chroma request at INFO, which drowns out the startup
+    # log. The Anthropic SDK uses httpx2 and logs every model call the same way.
+    for name in ("httpx", "httpx2"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     # Load the embedding model before serving so the first request does not
     # pay the multi-second load.
     embedding_model()
@@ -111,3 +116,59 @@ def health() -> JSONResponse:
 
     healthy = status["chroma"] == "ok" and status["anthropic_api_key"] == "set"
     return JSONResponse(status, status_code=200 if healthy else 503)
+
+
+class AskRequest(BaseModel):
+    # Whitespace is stripped first, so a blank question is rejected with a 422
+    # before the graph runs.
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class Source(BaseModel):
+    url: str
+    title: str
+    heading: str
+
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[Source]
+    path: list[str]
+
+
+@app.post("/ask")
+def ask(body: AskRequest) -> AskResponse:
+    """Answer a question from the indexed pages.
+
+    Runs the graph once and returns the answer, the pages the answer was
+    written from, and the nodes visited. A failing backing service returns
+    503 with the component name and, for a missing or rejected API key, the
+    env file to fix. A rate limit from Anthropic returns 429 with its
+    Retry-After header when it sent one.
+    """
+    try:
+        state = graph.invoke(initial_state(body.question))
+    except ComponentError as e:
+        headers = {"Retry-After": e.retry_after} if e.retry_after else None
+        raise HTTPException(
+            status_code=e.status_code, detail=f"{e.component}: {e}", headers=headers
+        ) from e
+    return AskResponse(answer=state["answer"], sources=sources(state), path=state["path"])
+
+
+def sources(state: State) -> list[Source]:
+    """List the distinct pages and headings behind the retrieved chunks, in rank order.
+
+    Parts of one split section share a URL and heading and collapse to one
+    entry.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[Source] = []
+    for doc in state["docs"]:
+        m = doc.metadata
+        key = (m["url"], m["heading"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Source(url=m["url"], title=m["title"], heading=m["heading"]))
+    return out
