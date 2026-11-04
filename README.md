@@ -52,7 +52,7 @@ flowchart LR
     api -. "when a seed fetch fails" .-> snapshot["data/pages snapshot in the image"]
 ```
 
-The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, and the committed snapshot is used when that fails.
+The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, for the product pages and the price catalogue, and the committed snapshot is used when that fails.
 
 ## Design choices
 
@@ -62,7 +62,7 @@ The API container does the embedding itself, so Chroma only stores and searches 
 | Model settings | Low effort, 1024 output tokens, no SDK retries, and one 30 second deadline per request that each model call inherits as its timeout. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The deadline returns a 504 after 30 seconds when the API hangs instead of holding the request for one timeout per call; a retry would run past the deadline. |
 | Embeddings | `intfloat/multilingual-e5-small` with sentence-transformers, inside the API container. | Good enough retrieval for this corpus at close to zero cost, and Dutch and English queries land on the same pages. Details below. |
 | Vector store | Chroma as a separate compose service, over HTTP. | One container, no schema, metadata stored with each vector, and the index lives outside the API process. Details below. |
-| Page data | Scraped at the first start; the committed snapshot is loaded when a seed fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. |
+| Page data | Scraped at the first start, plus the JSON catalogue behind the ordering page for subscription prices; the committed snapshot is loaded when either fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. The product pages render no internet prices, in a browser either; the ordering page loads them from the catalogue, so that is the only source for them. |
 | Crawl scope | Six seed URLs for the product sections, links followed only under the seed paths, two hops deep. | Depth 2 reaches the per-package and per-feature pages that answer price and feature questions, without pulling in support and account pages. |
 | Chunking | One chunk per heading section, prefixed with the page title and heading; sections over 1500 characters split at line boundaries. | Section boundaries give usable citations and keep one topic per chunk. The prefix lets a section that only reads "Vanaf € 45 per maand" carry its product. |
 | Low confidence | Grade the retrieved chunks; on a fail, retrieve 15 chunks instead of 5 and grade again; on a second fail, rewrite the query once and retrieve again; on a third fail, refuse. | Widening is local and costs no model call, and it covers the overview sections that rank just below the top five. Bounds a request at five model calls and gives an unanswerable question a fixed refusal instead of a guess. |
@@ -93,7 +93,9 @@ Chroma runs as its own container. A store outside the API process means an API i
 
 At startup the API checks the Chroma collection. When it is empty, the API scrapes the Ziggo product pages listed in `src/ziggo_rag/config.py`: each seed URL and the pages linked from it under the same path, up to `CRAWL_DEPTH` link hops away (default 2; the seeds are depth 0). Each page is reduced to its title and heading sections. The log reports every request, then a summary with page, section, and byte counts, and ends with `source=live`.
 
-ziggo.nl sits behind bot protection, so a seed fetch can fail with a non-200 status or a timeout. The API then loads the committed snapshot in `data/pages/` and logs `source=snapshot` with the failing seed and the crawl date from `data/pages/manifest.json`, which records when the snapshot was scraped, the seeds, and the depth. Refresh the snapshot with:
+The product pages carry speeds and package names but no subscription prices. The prices live in the ordering page at `ziggo.nl/tv-internet`, which loads them from a JSON catalogue endpoint; a rendered browser view of `/internet` shows no prices either, only links into that page. After the crawl the API fetches that catalogue with the same request the ordering page makes and adds one page for it, with the ordering page's URL so answers cite it. The page has one overview section per product family that lists every product with its monthly price, and one section per product with the price, the promotion when there is one, and the included features. The prices are those of a 12 month contract, the default in the ordering page, and the text says so. Standalone products with a monthly binding period (Kabel TV, TV Start with a CI+ module, standalone fixed telephony) are left out because their prices belong to a different offer. The endpoint is not a public API: a change in its payload or response makes the fetch fail, and startup then falls back to the snapshot.
+
+ziggo.nl sits behind bot protection, so a seed fetch can fail with a non-200 status or a timeout. The API then loads the committed snapshot in `data/pages/` and logs `source=snapshot` with the failing fetch and the crawl date from `data/pages/manifest.json`, which records when the snapshot was scraped, the seeds, the depth, and the catalogue URL. The catalogue is part of the same fallback, so the index never mixes live pages with snapshot prices. Refresh the snapshot with:
 
 ```sh
 uv run python -m ziggo_rag.scrape            # uses CRAWL_DEPTH
@@ -195,7 +197,7 @@ ask() { curl -s localhost:8000/ask -H 'content-type: application/json' -d "{\"qu
 curl -s localhost:8000/health
 ```
 
-Expect 200 with `chroma: ok`, `anthropic_api_key: set`, and `collection_count` of about 820.
+Expect 200 with `chroma: ok`, `anthropic_api_key: set`, and `collection_count` of about 840.
 
 ```sh
 docker compose logs api | grep -E "source=|collection .* holds|ingested .* from"
@@ -216,7 +218,13 @@ uv run python -m ziggo_rag.scrape
 python3 -m json.tool data/pages/internet.json | head -40
 ```
 
-Expect a log summary with about 78 pages and a page file with a title and a list of heading sections, without navigation or cookie text.
+Expect a log summary with about 78 pages, then one `GET` of the catalogue endpoint, and 79 page files written. The page file has a title and a list of heading sections, without navigation or cookie text.
+
+```sh
+uv run python -m ziggo_rag.catalogue
+```
+
+Expect the catalogue page's sections: an overview per family (`Internet`, `Televisie`, `Vast bellen`) with every product and its monthly price, then one section per product. `data/pages/tv-internet.json` holds the same sections as written by the scrape command.
 
 ### Index
 
@@ -255,6 +263,16 @@ Expect `path` of `["retrieve", "grade", "generate"]`, an answer in the language 
 grep -il "ziggo go" data/pages/*.json | head
 ```
 
+### Prices
+
+```sh
+ask "hoeveel betaal ik voor het snelste internet"
+ask "Wat kost internet bij Ziggo?"
+ask "How much is the 1 Gbit internet subscription?"
+```
+
+Expect `path` of `["retrieve", "grade", "generate"]` and `https://www.ziggo.nl/tv-internet` in `sources`. The first answer names Internet 8 Gbit/s at € 74,95 per month on a 12 month contract, the second lists the six internet subscriptions with their prices, and the third gives € 54,95 with the included speed and features. The prices come from the catalogue page; compare them with `data/pages/tv-internet.json`.
+
 ### Widen, rewrite, and refusal
 
 ```sh
@@ -268,11 +286,10 @@ The five nearest chunks for these questions name the packages but are FAQ fragme
 ```sh
 ask "Wat is de hoofdstad van Frankrijk?"
 ask "What is the capital of France?"
-ask "hoeveel betaal ik voor het snelste internet"
 docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
-Expect the fixed refusal, Dutch for the Dutch questions and English for the English one, `sources` of `[]`, and `path` of `["retrieve", "grade", "widen", "retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows four model calls per request: `grade=fail` at `k=5`, `grade=fail` at `k=15`, `rewrite`, `grade=fail`. The internet price question is refused because the scraped pages contain no section with both a speed and a price.
+Expect the fixed refusal, Dutch for the Dutch question and English for the English one, `sources` of `[]`, and `path` of `["retrieve", "grade", "widen", "retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows four model calls per request: `grade=fail` at `k=5`, `grade=fail` at `k=15`, `rewrite`, `grade=fail`.
 
 ### Failure handling
 

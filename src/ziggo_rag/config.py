@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # How many link hops to follow from the seeds. Depth 1 yields about 40
     # pages; depth 2 reaches the per-package and per-feature pages below them.
     crawl_depth: int = 2
+    # JSON catalogue behind the configurator at /tv-internet; the only source
+    # of internet subscription prices. Fetched after the crawl.
+    catalogue_url: str = "https://www.ziggo.nl/services/blueriq/b2c/info"
     # Committed scrape snapshot, loaded when a live scrape fails.
     pages_dir: Path = Path("data/pages")
 

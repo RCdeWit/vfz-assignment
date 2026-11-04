@@ -5,7 +5,9 @@ of the seed paths, up to a maximum depth (the seeds are depth 0). Each fetched
 page becomes one record: ``{"url", "title", "sections": [{"heading", "text"}]}``.
 Run the module directly to write those records to ``data/pages/`` as the
 committed snapshot, with a ``manifest.json`` recording the crawl time and
-parameters; ``--depth`` overrides the configured depth.
+parameters; ``--depth`` overrides the configured depth. The snapshot also
+holds the catalogue page from ``catalogue.py``, which carries the
+subscription prices the product pages do not render.
 
 ziggo.nl renders most product detail (package names, speeds, prices) through
 client-side templates. The server response carries that text inside
@@ -24,23 +26,18 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Tag
 from bs4.element import NavigableString, TemplateString
 
+from ziggo_rag.catalogue import fetch_catalogue
 from ziggo_rag.config import settings
+from ziggo_rag.pages import TIMEOUT_S, USER_AGENT, Page, ScrapeError, Section
 
 log = logging.getLogger("ziggo_rag.scrape")
 
-# ziggo.nl answers a 403 to the default httpx User-Agent.
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-)
-TIMEOUT_S = 10.0
 DELAY_S = 1.0
 # Shorter sections are icon captions and button labels ("Meer info").
 MIN_SECTION_CHARS = 40
@@ -52,21 +49,6 @@ HEADING_TAGS = ("h1", "h2", "h3")
 TEXT_TAGS = ("p", "li", "td", "th")
 # Exact types, so Comment, Script, and Stylesheet strings stay excluded.
 TEXT_TYPES = (NavigableString, TemplateString)
-
-
-class Section(TypedDict):
-    heading: str
-    text: str
-
-
-class Page(TypedDict):
-    url: str
-    title: str
-    sections: list[Section]
-
-
-class ScrapeError(Exception):
-    """Raised when a seed URL cannot be fetched: non-200 status, timeout, or no connection."""
 
 
 class _FetchFailed(Exception):
@@ -394,8 +376,10 @@ def main() -> int:
         "seeds": s.seed_urls,
         "max_depth": depth,
     }
+    manifest["catalogue_url"] = s.catalogue_url
     try:
         pages = scrape_pages(s.seed_urls, max_depth=depth)
+        pages.append(fetch_catalogue())
     except ScrapeError as e:
         log.error("scrape failed: %s", e)
         return 1

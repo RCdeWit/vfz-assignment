@@ -29,7 +29,8 @@ from chromadb.api.models.Collection import Collection
 
 from ziggo_rag.config import settings
 from ziggo_rag.llm import embed_passages, embed_queries
-from ziggo_rag.scrape import Page, load_snapshot
+from ziggo_rag.pages import Page
+from ziggo_rag.scrape import load_snapshot
 
 log = logging.getLogger("ziggo_rag.ingest")
 
