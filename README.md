@@ -35,7 +35,7 @@ Returns 200 when Chroma answers and the API key is set, else 503 with the status
 curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": "Wat is Ziggo GO?"}'
 ```
 
-Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order. `path` lists the graph nodes that ran.
+Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran.
 
 ## Page data
 
@@ -64,9 +64,17 @@ A volume created by an older build keeps its original distance metric, because C
 
 ## Answering
 
-A question runs through a LangGraph with two nodes. `retrieve` embeds the question with the same e5 model as the index and fetches the five nearest chunks from Chroma. `generate` sends those chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (answer in the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything outside the chunks; page content is data, not instructions). Both models run at low effort, which keeps a request to a few seconds.
+A question runs through a LangGraph with five nodes. `retrieve` embeds the current query with the same e5 model as the index and fetches the five nearest chunks from Chroma. `grade` asks `claude-haiku-5-5` whether those chunks contain the information the question asks for; the call returns a two-field structured output, `pass` or `fail` plus the question's language, and an output that does not parse counts as `fail`. On `pass`, `generate` sends the chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (answer in the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything outside the chunks; page content is data, not instructions). On the first `fail`, `rewrite` asks Haiku for a short Dutch search query in the vocabulary of the product pages and the graph retrieves and grades again. The query is Dutch whatever the question's language, because the pages are Dutch. On a second `fail`, `refuse` returns a fixed message, Dutch for a Dutch question and otherwise English, and clears the sources. A request therefore makes at most four model calls: grade, rewrite, grade, generate. All calls run at low effort, which keeps the happy path to a few seconds.
 
-A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the model declines to answer, the response is a fixed bilingual message pointing at ziggo.nl and customer service.
+```mermaid
+flowchart LR
+    S((start)) --> retrieve --> grade
+    grade -- pass --> generate --> E((end))
+    grade -- "fail, first time" --> rewrite --> retrieve
+    grade -- "fail, second time" --> refuse --> E
+```
+
+A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the generate model declines to answer, the response is the same as from the `refuse` node: the refusal text and no sources.
 
 ## Verifying each component
 
@@ -116,14 +124,31 @@ docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "Welke
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "What internet speeds are there?" -k 5
 ```
 
-Answering. Needs a real `ANTHROPIC_API_KEY`. The answer's facts appear in the chunks behind `sources`; check by opening the URLs or grepping `data/pages`. An English question gets an English answer. `path` is `["retrieve", "generate"]`:
+Answering. Needs a real `ANTHROPIC_API_KEY`. The answer's facts appear in the chunks behind `sources`; check by opening the URLs or grepping `data/pages`. An English question gets an English answer. `path` is `["retrieve", "grade", "generate"]` when the first retrieval passes the grade:
 
 ```sh
 ask() { curl -s localhost:8000/ask -H 'content-type: application/json' -d "{\"question\": \"$1\"}"; echo; }
-ask "Welke tv-pakketten heeft Ziggo?"
 ask "Wat is Ziggo GO?"
-ask "What TV packages does Ziggo offer?"
+ask "heeft ziggo een app om tv te kijken op mijn telefoon"
+ask "can I watch netflix through you"
 grep -il "ziggo go" data/pages/*.json | head
+```
+
+Rewrite. The TV package questions sit at the grade's boundary: the five nearest chunks name packages but are extra-channel pages rather than the package overview. The grade is a model judgment, so the same question fails the first grade in most runs and passes it in others. On a fail, `path` is `["retrieve", "grade", "rewrite", "retrieve", "grade", "generate"]` and the log shows the rewritten query; the second grade of the English question sometimes fails as well and refuses:
+
+```sh
+ask "Welke tv-pakketten heeft Ziggo?"
+ask "What TV packages does Ziggo offer?"
+docker compose logs --since 2m api | grep -E "grade=|rewrite "
+```
+
+Refusal. A question outside the pages gets the fixed refusal, Dutch for a Dutch question and otherwise English, `sources` is `[]`, and `path` is `["retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows three model calls for the request: `grade=fail`, `rewrite`, `grade=fail`. Internet subscription prices are refused as well, because the scraped pages contain no section with both a speed and a price:
+
+```sh
+ask "Wat is de hoofdstad van Frankrijk?"
+ask "What is the capital of France?"
+ask "hoeveel betaal ik voor het snelste internet"
+docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
 Input validation. A missing or blank question returns 422 without running the graph:
