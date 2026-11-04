@@ -8,18 +8,25 @@ boundaries, with the title and heading prefix repeated on each part.
 Vectors are computed here with the e5 model from ``llm.py`` and passed to
 Chroma explicitly. Chroma's own default embedding function (all-MiniLM-L6-v2,
 English only) is never used, so queries and passages share one model.
+
+Run the module directly to check the pipeline by hand. Without arguments it
+chunks the committed snapshot and prints size statistics. ``--ingest`` upserts
+the snapshot chunks into Chroma and prints the collection count. ``--query``
+embeds a question and prints the nearest chunks.
 """
 
+import argparse
 import hashlib
 import logging
+import sys
 from typing import TypedDict
 
 import chromadb
 from chromadb.api.models.Collection import Collection
 
 from ziggo_rag.config import settings
-from ziggo_rag.llm import embed_passages
-from ziggo_rag.scrape import Page
+from ziggo_rag.llm import embed_passages, embed_queries
+from ziggo_rag.scrape import Page, load_snapshot
 
 log = logging.getLogger("ziggo_rag.ingest")
 
@@ -129,3 +136,46 @@ def ingest(chunks: list[Chunk], collection: Collection) -> int:
         )
         log.info("ingested %d/%d chunks", min(start + BATCH_SIZE, len(chunks)), len(chunks))
     return len(chunks)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Chunk the committed snapshot; optionally ingest it or query Chroma."
+    )
+    parser.add_argument("--ingest", action="store_true", help="upsert the snapshot chunks")
+    parser.add_argument("--query", metavar="TEXT", help="print the nearest chunks for TEXT")
+    parser.add_argument("-k", type=int, default=3, help="results per query (default 3)")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # These libraries log model loading and every HTTP request at INFO, which
+    # hides the few lines this command prints.
+    for name in ("httpx", "sentence_transformers", "huggingface_hub"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    s = settings()
+
+    if args.query is None or args.ingest:
+        pages = load_snapshot(s.pages_dir)
+        chunks = chunk_pages(pages)
+        lengths = sorted(len(c["text"]) for c in chunks)
+        print(
+            f"pages={len(pages)} sections={sum(len(p['sections']) for p in pages)} "
+            f"chunks={len(chunks)} unique_ids={len({c['id'] for c in chunks})} "
+            f"split_parts={sum(c['metadata']['part'] > 0 for c in chunks)} "
+            f"median_chars={lengths[len(lengths) // 2]} max_chars={lengths[-1]}"
+        )
+    if args.ingest or args.query is not None:
+        client = chromadb.HttpClient(host=s.chroma_host, port=s.chroma_port)
+        collection = get_collection(client)
+    if args.ingest:
+        print(f"count before={collection.count()}")
+        ingest(chunks, collection)
+        print(f"count after={collection.count()}")
+    if args.query is not None:
+        result = collection.query(query_embeddings=embed_queries([args.query]), n_results=args.k)
+        for m, distance in zip(result["metadatas"][0], result["distances"][0], strict=True):
+            print(f"{distance:.3f} {m['url']} | {m['heading']} | part {m['part']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
