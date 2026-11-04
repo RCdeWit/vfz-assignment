@@ -1,29 +1,19 @@
 # Ziggo RAG assistant
 
-A question-answering API over Ziggo product pages. Run instructions, design choices, and diagrams are added as the project is built.
+A question-answering API over Ziggo's product pages. `POST /ask` takes a customer question in Dutch or English and returns an answer written from the scraped pages, the pages it was written from, and the graph nodes that ran. The stack is two containers: the API (FastAPI, a LangGraph graph, and a local embedding model) and Chroma as the vector store. Answers come from the Anthropic API.
 
-## Secrets
+## Running from a clean clone
 
-The Anthropic API key is read from the environment. `.env.1password` holds `op://` references to the 1Password items; it contains no secrets and is committed. Run commands through the 1Password CLI so the references are resolved at process start:
-
-```sh
-op run --env-file=.env.1password -- docker compose up --build
-```
-
-Or write a resolved `.env`, which compose picks up on its own. `.env` is gitignored.
+Needs Docker with Compose v2 and an Anthropic API key. Nothing else is installed on the host; `uv` is only needed for the host-side commands under [Verifying each component](#verifying-each-component).
 
 ```sh
-op inject -i .env.1password -o .env
+git clone https://github.com/RCdeWit/vfz-assignment.git
+cd vfz-assignment
+cp .env.1password .env     # replace the op:// value with the API key
 docker compose up --build
 ```
 
-Without 1Password, copy `.env.1password` to `.env` and replace the `op://` value with the key.
-
-The compose file passes `ANTHROPIC_API_KEY` from the shell into the container, and that value overrides `.env`. A shell that exports the variable as an empty string therefore starts the API without a key even when `.env` holds one; `/health` then reports `anthropic_api_key: missing`. Unset the variable or start compose with `env -u ANTHROPIC_API_KEY docker compose up`.
-
-## Running
-
-`docker compose up --build` starts Chroma and the API on port 8000. The first build downloads the embedding model and CPU-only torch; the API image is about 2.3 GB.
+`docker compose up --build` starts Chroma and the API on port 8000. The first build takes about a minute on a laptop when the downloads are cached; a first download adds roughly 1 GB of wheels, base image, and embedding model. The API image is 2.3 GB. The first start takes about two and a half minutes: the API scrapes about 90 pages from ziggo.nl one second apart, then embeds and indexes them in about half a minute. Later starts skip both and are up in a few seconds. The API is ready when the log shows `Application startup complete`.
 
 ```sh
 curl localhost:8000/health
@@ -36,6 +26,56 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": 
 ```
 
 Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran.
+
+### The API key
+
+The key is read from the environment. `.env.1password` holds an `op://` reference to the 1Password item; it contains no secret and is committed. With the 1Password CLI, resolve the reference at process start instead of writing `.env`:
+
+```sh
+op run --env-file=.env.1password -- docker compose up --build
+```
+
+Or write a resolved `.env`, which compose picks up on its own. `.env` is gitignored.
+
+```sh
+op inject -i .env.1password -o .env
+```
+
+The compose file passes `ANTHROPIC_API_KEY` from the shell into the container, and that value overrides `.env`. A shell that exports the variable as an empty string therefore starts the API without a key even when `.env` holds one; `/health` then reports `anthropic_api_key: missing`. Unset the variable or start compose with `env -u ANTHROPIC_API_KEY docker compose up`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([client]) -- "POST /ask, GET /health" --> api
+    subgraph compose["docker compose"]
+        api["api: FastAPI, LangGraph, e5 embeddings"]
+        chroma[("chroma: HNSW index on a volume")]
+    end
+    api -- "query vectors, top 5" --> chroma
+    api -- "grade, rewrite, generate" --> anthropic["Anthropic API"]
+    api -. "scrape at first start" .-> ziggo["ziggo.nl"]
+    api -. "when a seed fetch fails" .-> snapshot["data/pages snapshot in the image"]
+```
+
+The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, and the committed snapshot is used when that fails.
+
+## Design choices
+
+| Area | Choice | Reason |
+|---|---|---|
+| Language models | `claude-sonnet-5-5` writes the answer; `claude-haiku-5-5` grades retrieval and rewrites the query. | Sonnet for the customer-facing text. Haiku for the two internal calls, where speed and cost matter more than prose quality. |
+| Model settings | Low effort, 1024 output tokens, a 30 second timeout and one retry per call. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The timeout bounds a request at about four minutes when the API hangs; the SDK defaults would make that two hours. |
+| Embeddings | `intfloat/multilingual-e5-small` with sentence-transformers, inside the API container. | Anthropic has no embedding API, and a local model keeps the reviewer to one key. Multilingual because the pages are Dutch and questions may be English. The reasons in full are in the module docstring of `src/ziggo_rag/llm.py`. |
+| Vector store | Chroma as a separate compose service, over HTTP. | One container, no schema, metadata stored with each vector. The reasons in full are in the module docstring of `src/ziggo_rag/ingest.py`. |
+| Page data | Scraped at the first start; the committed snapshot is loaded when a seed fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. |
+| Crawl scope | Six seed URLs for the product sections, links followed only under the seed paths, two hops deep. | Depth 2 reaches the per-package and per-feature pages that answer price and feature questions, without pulling in support and account pages. |
+| Chunking | One chunk per heading section, prefixed with the page title and heading; sections over 1500 characters split at line boundaries. | Section boundaries give usable citations and keep one topic per chunk. The prefix lets a section that only reads "Vanaf € 45 per maand" carry its product. |
+| Low confidence | Grade the retrieved chunks; on a fail, rewrite the query once and retrieve again; on a second fail, refuse. | Bounds a request at four model calls and gives an unanswerable question a fixed refusal instead of a guess. |
+| Language | Dutch answers to Dutch questions, English otherwise. The rewritten query is Dutch. | Dutch customers and an English-speaking reviewer both get a readable answer. The query is Dutch because the pages are Dutch and the embedding places a Dutch query closer to them. |
+| Tooling | `uv`, `ruff`, one `pyproject.toml`, no test suite. | Verification is done with curl against the running stack; the commands are listed below. |
+
+Out of scope: authentication on the API, streaming, conversation history, a UI.
 
 ## Page data
 
@@ -75,6 +115,35 @@ flowchart LR
 ```
 
 A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the generate model declines to answer, the response is the same as from the `refuse` node: the refusal text and no sources.
+
+## Running on AWS
+
+The same components map to managed services. Nothing in the API depends on the local setup except the Chroma client and the Anthropic client, which are the two pieces that change.
+
+```mermaid
+flowchart LR
+    client([client]) --> waf["WAF"] --> alb["ALB"] --> ecs["ECS Fargate service: API tasks"]
+    ecs -- "VPC endpoint" --> bedrock["Bedrock: Claude Sonnet and Haiku"]
+    ecs -- "VPC endpoint" --> embed["Bedrock: embedding model"]
+    ecs -- "VPC endpoint" --> aoss[("OpenSearch Serverless vector collection")]
+    schedule["EventBridge schedule"] --> ingest["ECS task: scrape, embed, upsert"]
+    ingest -. fetch .-> ziggo["ziggo.nl"]
+    ingest --> s3[("S3 page snapshot")]
+    ingest --> embed
+    ingest --> aoss
+```
+
+| Local | AWS |
+|---|---|
+| API container | ECS Fargate service behind an Application Load Balancer, autoscaled on request count. |
+| Anthropic API | Bedrock with the same Claude models, through a VPC endpoint. The task's IAM role replaces the API key. |
+| e5 embeddings in the container | Bedrock Cohere Embed Multilingual, or e5 on a SageMaker Serverless endpoint when the model must stay the same. Queries and passages must use one model, so switching models means re-embedding the index. |
+| Chroma | OpenSearch Serverless vector collection, with the chunk metadata stored next to each vector as it is in Chroma. |
+| Scrape and ingest at API startup | A scheduled ECS task: crawl, write the pages to S3, embed, upsert. |
+
+Scaling. The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+
+Security. The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers; the question itself is logged only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the chunk text is stripped of the prompt's tag names, which limits prompt injection through a modified page but does not rule it out.
 
 ## Verifying each component
 
