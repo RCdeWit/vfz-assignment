@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "RCdeWit", email = "RCdeWit@users.noreply.github.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "chromadb>=1.5.9",
@@ -31,7 +31,7 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
