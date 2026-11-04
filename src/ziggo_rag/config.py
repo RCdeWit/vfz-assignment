@@ -19,8 +19,10 @@ class Settings(BaseSettings):
     chroma_port: int = 8000
     chroma_collection: str = "ziggo_pages"
 
-    # /ziggo-go on the live site redirects to /televisie/ziggo-go.
+    # The homepage is scraped for its content but, unlike the other seeds, does
+    # not widen the crawl: links are only followed under the other seed paths.
     seed_urls: list[str] = [
+        "https://www.ziggo.nl/",
         "https://www.ziggo.nl/internet",
         "https://www.ziggo.nl/televisie",
         "https://www.ziggo.nl/televisie/ziggo-go",
