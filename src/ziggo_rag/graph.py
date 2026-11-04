@@ -173,8 +173,10 @@ def initial_state(question: str) -> State:
 def retrieve(state: State) -> dict:
     """Embed ``query`` locally and fetch the TOP_K nearest chunks from Chroma.
 
-    Writes ``docs``. Raises ComponentError("chroma") when Chroma cannot be
-    reached, the query fails, or the collection is empty.
+    Reads ``query``. Writes ``docs``: one Document per chunk, holding the
+    chunk text and its url, title, heading, and part. Raises
+    ComponentError("chroma") when Chroma cannot be reached, the query fails,
+    or the collection is empty.
     """
     # Embedding runs outside the try below so a model failure is not reported
     # as a Chroma failure.
@@ -204,10 +206,13 @@ def retrieve(state: State) -> dict:
 def grade(state: State) -> dict:
     """Judge with the grade model whether ``docs`` can answer ``question``.
 
-    Writes ``grade`` and ``language``. Empty ``docs`` writes ``fail`` without
-    a call. The model is held to the Grade schema; an output that still does
-    not parse, including a refusal, counts as ``fail``. Raises
-    ComponentError("anthropic") on key, connection, and rate limit errors.
+    Reads ``question`` and ``docs``. Sends the chunks and the question to the
+    grade model, which returns ``pass`` or ``fail`` and the question's
+    language as structured output. Writes ``grade`` and ``language``. Empty
+    ``docs`` writes ``fail`` without a call. The model is held to the Grade
+    schema; an output that still does not parse, including a refusal, counts
+    as ``fail``. Raises ComponentError("anthropic") on key, connection, and
+    rate limit errors.
     """
     path = [*state["path"], "grade"]
     if not state["docs"]:
@@ -234,11 +239,12 @@ def grade(state: State) -> dict:
 
 
 def rewrite(state: State) -> dict:
-    """Rephrase ``query`` with the grade model as a Dutch query in the product pages' vocabulary.
+    """Rephrase the question with the grade model as a Dutch query in the pages' vocabulary.
 
-    Writes ``query`` and increments ``rewrites``. An empty model output keeps
-    the current query, so the next retrieval still runs. Raises
-    ComponentError("anthropic") on key, connection, and rate limit errors.
+    Reads ``question`` and ``rewrites``. Writes ``query`` and ``rewrites``
+    plus one. An empty model output keeps the current query, so the next
+    retrieval still runs. Raises ComponentError("anthropic") on key,
+    connection, and rate limit errors.
     """
     # Only the question is sent: with MAX_REWRITES of 1 the query still equals
     # the question here. A higher limit should also send the previous query.
@@ -256,8 +262,11 @@ def rewrite(state: State) -> dict:
 def generate(state: State) -> dict:
     """Write the answer with the generate model from ``question`` and ``docs``.
 
-    Writes ``answer``; a refusal by the model also clears ``docs``. Raises
-    ComponentError("anthropic") on key, connection, and rate limit errors.
+    Reads ``question``, ``docs``, and ``language``. Sends the system prompt,
+    the chunks, and the question to the generate model. Writes ``answer``.
+    When the model refuses, writes the fixed refusal instead and clears
+    ``docs``. Raises ComponentError("anthropic") on key, connection, and rate
+    limit errors.
     """
     with _anthropic_errors():
         response = generate_model().invoke(
@@ -281,8 +290,9 @@ def generate(state: State) -> dict:
 def refuse(state: State) -> dict:
     """Write the fixed refusal: Dutch for a Dutch question, otherwise English.
 
-    Writes ``answer`` and clears ``docs``, so the response lists no sources
-    for chunks that the grade found unrelated to the question.
+    Reads ``language``. Writes ``answer`` and clears ``docs``, so the response
+    lists no sources for chunks that the grade found unrelated to the
+    question. Makes no model call.
     """
     return {"answer": refusal(state["language"]), "docs": [], "path": [*state["path"], "refuse"]}
 
@@ -304,7 +314,11 @@ def refusal(language: Language | None) -> str:
 
 
 def after_grade(state: State) -> Literal["generate", "rewrite", "refuse"]:
-    """Pick the node after grade: pass answers, fail rewrites once, then refuses."""
+    """Pick the node after grade from ``grade`` and ``rewrites``.
+
+    ``pass`` goes to generate. ``fail`` goes to rewrite while fewer than
+    MAX_REWRITES rewrites have run, otherwise to refuse.
+    """
     if state["grade"] == "pass":
         return "generate"
     if state["rewrites"] < MAX_REWRITES:
