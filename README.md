@@ -41,3 +41,69 @@ uv run python -m ziggo_rag.scrape --depth 1  # override for one run
 ```
 
 Each extra depth level multiplies the page count and the run time; requests are one second apart.
+
+## Index
+
+After the pages are loaded, the API splits each heading section into a chunk, prefixed with the page title and heading so the embedding carries the product context. Sections over 1500 characters are split at line boundaries, with the prefix repeated on each part. Each chunk is embedded locally with `intfloat/multilingual-e5-small` and upserted into the Chroma collection with its vector; Chroma does not embed anything itself. The log ends with the chunk and page counts, and `/health` reports the same number as `collection_count`.
+
+Chunk ids are a hash of the page URL, heading, and part number, so ingesting the same pages again leaves the collection unchanged. When the last batch is written, the API stamps the collection metadata with `ingested_at`. Startup skips scrape and ingest only when that stamp is present, so a start that was interrupted halfway through is retried on the next one, and `docker compose restart api` reuses a finished index. Ingest never deletes chunks: a section that was renamed or removed since the index was built stays in it until the index is rebuilt. To rebuild from scratch, drop the Chroma volume:
+
+```sh
+docker compose down -v && docker compose up --build
+```
+
+A volume created by an older build keeps its original distance metric, because Chroma ignores the metadata passed to an existing collection. Rankings are unaffected, since the vectors are normalised, but the distances printed by the query command below differ until the volume is rebuilt.
+
+## Verifying each component
+
+The commands below run against the compose stack. Commands prefixed with `docker compose exec api` run inside the API container, which has the embedding model and can reach Chroma; the same modules run on the host with `uv run python -m ...` when `CHROMA_HOST` and `CHROMA_PORT` point at a reachable Chroma.
+
+Health. Expect 200 with `chroma: ok` and a non-zero `collection_count`; 503 when Chroma is down or the key is missing:
+
+```sh
+curl -s localhost:8000/health
+```
+
+Startup path. The log shows whether the pages came from the live site or the snapshot, and how many chunks were ingested:
+
+```sh
+docker compose logs api | grep -E "source=|collection .* holds|ingested .* from"
+```
+
+Restart. A second start finds the collection filled and skips scrape and ingest; the log shows `collection ziggo_pages holds N chunks` and no `source=` line:
+
+```sh
+docker compose restart api && docker compose logs --since 1m api | grep -E "source=|holds"
+```
+
+Scrape. Refresh the snapshot and inspect one page file; each file has a title and a list of heading sections:
+
+```sh
+uv run python -m ziggo_rag.scrape
+python3 -m json.tool data/pages/internet.json | head -40
+```
+
+Chunking. Chunks the snapshot without touching Chroma and prints counts and sizes. `unique_ids` equals `chunks`, and `max_chars` stays under about 1600:
+
+```sh
+uv run python -m ziggo_rag.ingest
+```
+
+Ingest idempotence. Upserts the snapshot chunks and prints the collection count before and after. Running it against an index built from the same pages leaves the count unchanged. An index built from a live scrape that has since diverged from the snapshot gains the snapshot's chunks instead, because their ids differ:
+
+```sh
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --ingest
+```
+
+Retrieval. Prints the nearest chunks with their cosine distance, URL, heading, and part. A Dutch and an English phrasing of the same question return the same pages:
+
+```sh
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "Welke internetsnelheden zijn er?"
+docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "What internet speeds are there?" -k 5
+```
+
+Lint and format:
+
+```sh
+uv run ruff check . && uv run ruff format --check .
+```
