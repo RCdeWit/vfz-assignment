@@ -1,6 +1,7 @@
 """Runtime settings, read from environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,13 +19,16 @@ class Settings(BaseSettings):
     chroma_port: int = 8000
     chroma_collection: str = "ziggo_pages"
 
+    # /ziggo-go on the live site redirects to /televisie/ziggo-go.
     seed_urls: list[str] = [
         "https://www.ziggo.nl/internet",
         "https://www.ziggo.nl/televisie",
-        "https://www.ziggo.nl/ziggo-go",
+        "https://www.ziggo.nl/televisie/ziggo-go",
         "https://www.ziggo.nl/alles-in-1",
         "https://www.ziggo.nl/mobiel",
     ]
+    # Committed scrape snapshot, loaded when a live scrape fails.
+    pages_dir: Path = Path("data/pages")
 
 
 @lru_cache
