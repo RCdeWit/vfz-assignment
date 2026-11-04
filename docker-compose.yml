@@ -1,0 +1,30 @@
+services:
+  chroma:
+    image: chromadb/chroma:1.5.9
+    volumes:
+      - chroma-data:/data
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-c", "cat < /dev/null > /dev/tcp/localhost/8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    # .env is produced by `op inject -i .env.1password -o .env`, or the key is
+    # passed through from the shell by `op run --env-file=.env.1password -- docker compose up`.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+    depends_on:
+      chroma:
+        condition: service_healthy
+
+volumes:
+  chroma-data:
