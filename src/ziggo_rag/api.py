@@ -7,19 +7,21 @@ How the pieces connect:
   previous ingest finished. Chroma down or a failed ingest is logged, not
   raised, so the server comes up and ``/health`` reports the problem.
 - ``/ask`` validates the body, runs the compiled graph once with a fresh
-  state, and maps the final state to the response. The graph's retrieve
-  node opens its own Chroma client per call; the client is a thin HTTP
-  wrapper, so no connection is shared between startup and requests.
-- Errors. A node that cannot use Chroma or the Anthropic API raises
-  ``ComponentError``; ``/ask`` returns the status it carries (503, or 429
-  for a rate limit) with ``detail`` set to the component name and message.
-  A missing or blank question is a 422 from request validation. Any other
-  exception is a 500 from FastAPI. Missing data is not an error: when the
-  grade fails twice, the graph answers with the refusal and no sources at
-  status 200.
+  state and a deadline of ``request_timeout`` seconds from now, and maps the
+  final state to the response. The graph's retrieve node opens its own
+  Chroma client per call; the client is a thin HTTP wrapper, so no
+  connection is shared between startup and requests.
+- Errors. A node that cannot use Chroma or the Anthropic API, or that runs
+  past the deadline, raises ``ComponentError``; ``/ask`` returns the status
+  it carries (503, 429 for a rate limit, 504 for the deadline) with
+  ``detail`` set to the component name and message. A missing or blank
+  question is a 422 from request validation. Any other exception is a 500
+  from FastAPI. Missing data is not an error: when the grade fails three
+  times, the graph answers with the refusal and no sources at status 200.
 """
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -165,18 +167,24 @@ def ask(body: AskRequest) -> AskResponse:
     written from, and the nodes visited. A failing backing service returns
     503 with the component name and, for a missing or rejected API key, the
     env file to fix. A rate limit from Anthropic returns 429 with its
-    Retry-After header when it sent one.
+    Retry-After header when it sent one. A request that does not finish
+    within ``request_timeout`` seconds returns 504.
     """
     # The handler is a plain def, so FastAPI runs it in a worker thread and
     # the blocking model and Chroma calls inside the graph do not stall the
     # event loop. The graph keeps no state between calls; each request
     # starts from initial_state and reads the result from the final state.
+    # The deadline is monotonic time, matching what the graph compares with.
+    deadline = time.monotonic() + settings().request_timeout
     try:
-        state = graph.invoke(initial_state(body.question))
+        state = graph.invoke(
+            initial_state(body.question), config={"configurable": {"deadline": deadline}}
+        )
     except ComponentError as e:
         # Chroma: 503. Anthropic key empty or rejected: 503 naming the env
         # file. Anthropic unreachable: 503. Anthropic rate limit: 429, with
-        # Retry-After passed through when Anthropic sent it.
+        # Retry-After passed through when Anthropic sent it. Deadline
+        # passed, before or during a model call: 504.
         headers = {"Retry-After": e.retry_after} if e.retry_after else None
         raise HTTPException(
             status_code=e.status_code, detail=f"{e.component}: {e}", headers=headers

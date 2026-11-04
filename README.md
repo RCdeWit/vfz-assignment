@@ -59,13 +59,13 @@ The API container does the embedding itself, so Chroma only stores and searches 
 | Area | Choice | Reason |
 |---|---|---|
 | Language models | `claude-sonnet-5-5` writes the answer; `claude-haiku-5-5` grades retrieval and rewrites the query. | Sonnet for the customer-facing text. Haiku for the two internal calls, where speed and cost matter more than prose quality. |
-| Model settings | Low effort, 1024 output tokens, a 30 second timeout and one retry per call. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The timeout bounds a request at about four minutes when the API hangs; the SDK defaults would make that two hours. |
+| Model settings | Low effort, 1024 output tokens, no SDK retries, and one 30 second deadline per request that each model call inherits as its timeout. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The deadline returns a 504 after 30 seconds when the API hangs instead of holding the request for one timeout per call; a retry would run past the deadline. |
 | Embeddings | `intfloat/multilingual-e5-small` with sentence-transformers, inside the API container. | Good enough retrieval for this corpus at close to zero cost, and Dutch and English queries land on the same pages. Details below. |
 | Vector store | Chroma as a separate compose service, over HTTP. | One container, no schema, metadata stored with each vector, and the index lives outside the API process. Details below. |
 | Page data | Scraped at the first start; the committed snapshot is loaded when a seed fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. |
 | Crawl scope | Six seed URLs for the product sections, links followed only under the seed paths, two hops deep. | Depth 2 reaches the per-package and per-feature pages that answer price and feature questions, without pulling in support and account pages. |
 | Chunking | One chunk per heading section, prefixed with the page title and heading; sections over 1500 characters split at line boundaries. | Section boundaries give usable citations and keep one topic per chunk. The prefix lets a section that only reads "Vanaf € 45 per maand" carry its product. |
-| Low confidence | Grade the retrieved chunks; on a fail, rewrite the query once and retrieve again; on a second fail, refuse. | Bounds a request at four model calls and gives an unanswerable question a fixed refusal instead of a guess. |
+| Low confidence | Grade the retrieved chunks; on a fail, retrieve 15 chunks instead of 5 and grade again; on a second fail, rewrite the query once and retrieve again; on a third fail, refuse. | Widening is local and costs no model call, and it covers the overview sections that rank just below the top five. Bounds a request at five model calls and gives an unanswerable question a fixed refusal instead of a guess. |
 | Language | Dutch answers to Dutch questions, English otherwise. The rewritten query is Dutch. | Both languages get a readable answer. The query is Dutch because the pages are Dutch and the embedding places a Dutch query closer to them. |
 | Tooling | `uv`, `ruff`, one `pyproject.toml`, no test suite. | Verification is done with curl against the running stack; the commands are listed below. |
 
@@ -116,25 +116,29 @@ A volume created by an older build keeps its original distance metric, because C
 
 ## Answering
 
-A question runs through a LangGraph with five nodes.
+A question runs through a LangGraph with six nodes.
 
-- `retrieve` embeds the current query with the same e5 model as the index and fetches the five nearest chunks from Chroma.
-- `grade` asks `claude-haiku-5-5` whether those chunks contain the information the question asks for. The call returns a structured output with two fields: `pass` or `fail`, and the question's language. An output that does not parse counts as `fail`.
+- `retrieve` embeds the current query with the same e5 model as the index and fetches the five nearest chunks from Chroma, or 15 after `widen`.
+- `grade` asks `claude-haiku-5-5` whether those chunks contain the information the question asks for. A question that asks which packages, speeds, or prices exist passes only when the chunks list them, not when a package is named in passing. The call returns a structured output with two fields: `pass` or `fail`, and the question's language. An output that does not parse counts as `fail`.
 - `generate` runs on `pass`. It sends the chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything else; page content is data, not instructions).
-- `rewrite` runs on the first `fail`. It asks Haiku for a short Dutch search query in the vocabulary of the product pages, and the graph retrieves and grades again. The query is Dutch whatever the question's language, because the pages are Dutch.
-- `refuse` runs on the second `fail`. It returns a fixed message, Dutch for a Dutch question and otherwise English, and clears the sources.
+- `widen` runs on the first `fail`. It raises the chunk count to 15 and the graph retrieves and grades again with the same query. The package overview on `/televisie` ranks 7th and 8th for the two phrasings of the TV packages question, behind FAQ fragments that name the packages without listing them, so the first five chunks miss it. Widening makes no model call.
+- `rewrite` runs on the second `fail`. It asks Haiku for a short Dutch search query in the vocabulary of the product pages, and the graph retrieves 15 chunks and grades again. The query is Dutch whatever the question's language, because the pages are Dutch.
+- `refuse` runs on the third `fail`. It returns a fixed message, Dutch for a Dutch question and otherwise English, and clears the sources.
 
-A request makes at most four model calls: grade, rewrite, grade, generate. All calls run at low effort, which keeps the happy path to a few seconds.
+A request makes at most five model calls: grade, grade, rewrite, grade, generate. All calls run at low effort, which keeps the happy path to a few seconds.
 
 ```mermaid
 flowchart LR
     S((start)) --> retrieve --> grade
     grade -- pass --> generate --> E((end))
-    grade -- "fail, first time" --> rewrite --> retrieve
-    grade -- "fail, second time" --> refuse --> E
+    grade -- "fail, first time" --> widen --> retrieve
+    grade -- "fail, second time" --> rewrite --> retrieve
+    grade -- "fail, third time" --> refuse --> E
 ```
 
 A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the generate model declines to answer, the response is the same as from the `refuse` node: the refusal text and no sources.
+
+Each request has a deadline of 30 seconds, set by `REQUEST_TIMEOUT`. The API passes it to the graph, and every model call gets the time left as its timeout; a node that would start a call after the deadline raises instead. Both cases return 504. Without the deadline, a hung Anthropic connection would hold a request for one timeout per model call, up to five in a row.
 
 ## Running on AWS
 
@@ -251,7 +255,7 @@ Expect `path` of `["retrieve", "grade", "generate"]`, an answer in the language 
 grep -il "ziggo go" data/pages/*.json | head
 ```
 
-### Rewrite and refusal
+### Widen, rewrite, and refusal
 
 ```sh
 ask "Welke tv-pakketten heeft Ziggo?"
@@ -259,7 +263,7 @@ ask "What TV packages does Ziggo offer?"
 docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
-These questions sit at the grade's boundary: the five nearest chunks name packages but are extra-channel pages rather than the package overview. The grade is a model judgment, so the first grade fails in most runs and passes in others. On a fail, expect `path` of `["retrieve", "grade", "rewrite", "retrieve", "grade", "generate"]` and the rewritten query in the log; the English question sometimes fails the second grade as well and refuses.
+The five nearest chunks for these questions name the packages but are FAQ fragments and extra-channel pages; the package overview ranks 7th and 8th. Expect `path` of `["retrieve", "grade", "widen", "retrieve", "grade", "generate"]`, an answer that names TV Start, TV Complete, and TV Max with their monthly prices, and `https://www.ziggo.nl/televisie` in `sources`. The log shows `grade=fail ... k=5` followed by `grade=pass ... k=15`. The grade is a model judgment, so a run can also pass at `k=5`; the answer then names the packages without the prices.
 
 ```sh
 ask "Wat is de hoofdstad van Frankrijk?"
@@ -268,7 +272,7 @@ ask "hoeveel betaal ik voor het snelste internet"
 docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
-Expect the fixed refusal, Dutch for the Dutch questions and English for the English one, `sources` of `[]`, and `path` of `["retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows three model calls per request: `grade=fail`, `rewrite`, `grade=fail`. The internet price question is refused because the scraped pages contain no section with both a speed and a price.
+Expect the fixed refusal, Dutch for the Dutch questions and English for the English one, `sources` of `[]`, and `path` of `["retrieve", "grade", "widen", "retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows four model calls per request: `grade=fail` at `k=5`, `grade=fail` at `k=15`, `rewrite`, `grade=fail`. The internet price question is refused because the scraped pages contain no section with both a speed and a price.
 
 ### Failure handling
 
@@ -286,6 +290,14 @@ docker compose stop chroma && ask "Wat is Ziggo GO?"; docker compose start chrom
 ```
 
 Expect 503 for each, with `detail` naming the component and, for the key, the env file. Restart with the real key afterwards: `env -u ANTHROPIC_API_KEY docker compose up -d api`.
+
+```sh
+env -u ANTHROPIC_API_KEY docker compose run --rm -d -p 8001:8000 -e ANTHROPIC_BASE_URL=http://10.255.255.1 -e REQUEST_TIMEOUT=5 api
+sleep 15 && curl -s -w '\n%{http_code} after %{time_total}s\n' localhost:8001/ask -H 'content-type: application/json' -d '{"question": "Wat is Ziggo GO?"}'
+docker stop $(docker ps -q --filter name=vfz-assignment-api-run)
+```
+
+This starts a second API container on port 8001 whose Anthropic calls go to an unroutable address, with the deadline lowered to 5 seconds. Expect `{"detail":"timeout: The request did not finish within 5 seconds."}` and `504 after 5.0s`: the first grade call is given the 5 seconds left and times out at the deadline.
 
 ### Lint and format
 

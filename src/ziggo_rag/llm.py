@@ -53,10 +53,10 @@ def grade_model() -> ChatAnthropic:
 
 
 def _chat(model: str) -> ChatAnthropic:
-    # One attempt plus one retry within about a minute per call. A request
-    # makes up to four calls in sequence, so a hung connection holds a request
-    # thread for at most about four minutes. The SDK default is a ten minute
-    # timeout with two retries, which would make that two hours.
+    # No SDK retries: the graph gives each call the time left until the
+    # request deadline as its timeout, and a retry would run past it. The
+    # timeout set here applies only to calls made without a deadline, such
+    # as from a Python shell; the graph passes ``timeout`` on every call.
     # Claude 5.5 models reject a non-default temperature with a 400 and always
     # run adaptive thinking, so output variation and depth are controlled with
     # effort instead. Low effort suits these calls: the answer is a few
@@ -65,7 +65,7 @@ def _chat(model: str) -> ChatAnthropic:
         model=model,
         max_tokens=1024,
         effort="low",
-        default_request_timeout=30.0,
-        max_retries=1,
+        default_request_timeout=settings().request_timeout,
+        max_retries=0,
         api_key=settings().anthropic_api_key or None,
     )
