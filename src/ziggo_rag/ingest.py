@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import logging
 import sys
+from datetime import UTC, datetime
 from typing import TypedDict
 
 import chromadb
@@ -32,9 +33,15 @@ log = logging.getLogger("ziggo_rag.ingest")
 
 # Section text above this length is split into parts. Chunk text is the
 # section part plus the title and heading prefix, so a chunk can be a little
-# longer than this.
+# longer than this. The limit keeps chunks under the e5 model's 512-token
+# input; longer input is truncated without an error, so the tail of a chunk
+# would be stored but never embedded. On the committed snapshot the longest
+# chunk is about 460 tokens.
 MAX_SECTION_CHARS = 1500
 BATCH_SIZE = 100
+# Collection metadata key written after the last batch. Startup only skips
+# ingest when it is present, so a run that died halfway is retried.
+INGESTED_AT_KEY = "ingested_at"
 
 
 class ChunkMetadata(TypedDict):
@@ -60,6 +67,15 @@ def get_collection(client: chromadb.ClientAPI) -> Collection:
     return client.get_or_create_collection(
         settings().chroma_collection, metadata={"hnsw:space": "cosine"}
     )
+
+
+def is_ingested(collection: Collection) -> bool:
+    """Report whether a previous ingest ran to completion on this collection.
+
+    A non-zero count is not enough: a process killed between batches leaves a
+    partial index that would otherwise be served as complete.
+    """
+    return INGESTED_AT_KEY in (collection.metadata or {})
 
 
 def chunk_pages(pages: list[Page]) -> list[Chunk]:
@@ -121,10 +137,12 @@ def _chunk_id(url: str, heading: str, occurrence: int, part: int) -> str:
 
 
 def ingest(chunks: list[Chunk], collection: Collection) -> int:
-    """Embed the chunks and upsert them into the collection in batches; return the count.
+    """Embed the chunks, upsert them in batches, mark the collection complete, and return the count.
 
     Upsert rather than add so a re-run with the same pages does not fail on
-    existing ids.
+    existing ids. Nothing is deleted: a chunk whose section was renamed or
+    removed since the last run stays in the collection. Rebuild from an empty
+    volume to drop stale chunks.
     """
     for start in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[start : start + BATCH_SIZE]
@@ -135,6 +153,13 @@ def ingest(chunks: list[Chunk], collection: Collection) -> int:
             metadatas=[c["metadata"] for c in batch],
         )
         log.info("ingested %d/%d chunks", min(start + BATCH_SIZE, len(chunks)), len(chunks))
+    # modify replaces the whole metadata dict, so existing keys are carried
+    # over, except the hnsw: settings: Chroma rejects an update that names the
+    # distance function even when the value is unchanged. The index keeps its
+    # distance function regardless of the metadata.
+    kept = {k: v for k, v in (collection.metadata or {}).items() if not k.startswith("hnsw:")}
+    stamp = datetime.now(UTC).replace(microsecond=0).isoformat()
+    collection.modify(metadata={**kept, INGESTED_AT_KEY: stamp})
     return len(chunks)
 
 

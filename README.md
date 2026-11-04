@@ -46,11 +46,13 @@ Each extra depth level multiplies the page count and the run time; requests are 
 
 After the pages are loaded, the API splits each heading section into a chunk, prefixed with the page title and heading so the embedding carries the product context. Sections over 1500 characters are split at line boundaries, with the prefix repeated on each part. Each chunk is embedded locally with `intfloat/multilingual-e5-small` and upserted into the Chroma collection with its vector; Chroma does not embed anything itself. The log ends with the chunk and page counts, and `/health` reports the same number as `collection_count`.
 
-Chunk ids are a hash of the page URL, heading, and part number, so ingesting the same pages again leaves the collection unchanged. Ingest only runs when the collection is empty; `docker compose restart api` reuses the existing index. To rebuild the index from scratch, drop the Chroma volume:
+Chunk ids are a hash of the page URL, heading, and part number, so ingesting the same pages again leaves the collection unchanged. When the last batch is written, the API stamps the collection metadata with `ingested_at`. Startup skips scrape and ingest only when that stamp is present, so a start that was interrupted halfway through is retried on the next one, and `docker compose restart api` reuses a finished index. Ingest never deletes chunks: a section that was renamed or removed since the index was built stays in it until the index is rebuilt. To rebuild from scratch, drop the Chroma volume:
 
 ```sh
 docker compose down -v && docker compose up --build
 ```
+
+A volume created by an older build keeps its original distance metric, because Chroma ignores the metadata passed to an existing collection. Rankings are unaffected, since the vectors are normalised, but the distances printed by the query command below differ until the volume is rebuilt.
 
 ## Verifying each component
 
@@ -87,7 +89,7 @@ Chunking. Chunks the snapshot without touching Chroma and prints counts and size
 uv run python -m ziggo_rag.ingest
 ```
 
-Ingest idempotence. Upserts the snapshot chunks and prints the collection count before and after. Running it against a filled collection leaves the count unchanged:
+Ingest idempotence. Upserts the snapshot chunks and prints the collection count before and after. Running it against an index built from the same pages leaves the count unchanged. An index built from a live scrape that has since diverged from the snapshot gains the snapshot's chunks instead, because their ids differ:
 
 ```sh
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --ingest

@@ -4,11 +4,12 @@ import logging
 from contextlib import asynccontextmanager
 
 import chromadb
+from chromadb.api.models.Collection import Collection
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from ziggo_rag.config import settings
-from ziggo_rag.ingest import chunk_pages, get_collection, ingest
+from ziggo_rag.ingest import INGESTED_AT_KEY, chunk_pages, get_collection, ingest, is_ingested
 from ziggo_rag.llm import embedding_model
 from ziggo_rag.scrape import Page, ScrapeError, load_snapshot, read_manifest, scrape_pages
 
@@ -30,28 +31,38 @@ async def lifespan(app: FastAPI):
     # pay the multi-second load.
     embedding_model()
     log.info("embedding model loaded")
-    if collection_is_empty():
-        pages = load_pages()
-        chunks = chunk_pages(pages)
-        count = ingest(chunks, get_collection(chroma_client()))
-        log.info("ingested %d chunks from %d pages", count, len(pages))
+    collection = startup_collection()
+    if collection is not None and not is_ingested(collection):
+        try:
+            pages = load_pages()
+            count = ingest(chunk_pages(pages), collection)
+            log.info("ingested %d chunks from %d pages", count, len(pages))
+        except Exception as e:  # any failure here must not stop the server
+            # The server still comes up so /health can report the state. The
+            # completion marker is missing, so the next start retries.
+            log.error("startup ingest failed, index incomplete: %s", e)
     yield
 
 
-def collection_is_empty() -> bool:
-    """Report whether the Chroma collection has no chunks yet.
+def startup_collection() -> Collection | None:
+    """Return the Chroma collection, or None when Chroma cannot be reached.
 
-    Returns False when Chroma cannot be reached, so startup completes and
-    /health reports the outage instead of the process crashing.
+    Returning None lets startup complete so /health reports the outage
+    instead of the process crashing. The log line states the chunk count and
+    whether a previous ingest finished.
     """
     s = settings()
     try:
-        count = get_collection(chroma_client()).count()
+        collection = get_collection(chroma_client())
+        count = collection.count()
     except Exception as e:  # chromadb raises several unrelated types on connection failure
-        log.warning("chroma unreachable at startup, skipping scrape: %s", e)
-        return False
-    log.info("collection %s holds %d chunks", s.chroma_collection, count)
-    return count == 0
+        log.warning("chroma unreachable at startup, skipping scrape and ingest: %s", e)
+        return None
+    ingested_at = (collection.metadata or {}).get(INGESTED_AT_KEY, "never")
+    log.info(
+        "collection %s holds %d chunks, ingested_at=%s", s.chroma_collection, count, ingested_at
+    )
+    return collection
 
 
 def load_pages() -> list[Page]:
