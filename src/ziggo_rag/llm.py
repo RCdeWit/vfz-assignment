@@ -1,9 +1,10 @@
 """Model access: Anthropic chat model factories and the local embedding model.
 
-Embeddings are computed locally with multilingual-e5-small rather than by a
-hosted API. Anthropic has no embedding endpoint, and a local model keeps the
-reviewer to one API key. The model is multilingual because the source pages are
-Dutch and questions may be English.
+Embeddings are computed in this process with ``intfloat/multilingual-e5-small``
+through sentence-transformers; the README's design choices section gives the
+reasons for the model. The e5 models expect a ``query: `` or ``passage: ``
+prefix, added here, and the vectors are normalised so cosine distance and dot
+product rank identically.
 """
 
 from functools import lru_cache

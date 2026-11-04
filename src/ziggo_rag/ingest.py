@@ -9,6 +9,8 @@ Vectors are computed here with the e5 model from ``llm.py`` and passed to
 Chroma explicitly. Chroma's own default embedding function (all-MiniLM-L6-v2,
 English only) is never used, so queries and passages share one model.
 
+The README's design choices section gives the reasons for Chroma.
+
 Run the module directly to check the pipeline by hand. Without arguments it
 chunks the committed snapshot and prints size statistics. ``--ingest`` upserts
 the snapshot chunks into Chroma and prints the collection count. ``--query``

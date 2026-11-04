@@ -1,29 +1,19 @@
 # Ziggo RAG assistant
 
-A question-answering API over Ziggo product pages. Run instructions, design choices, and diagrams are added as the project is built.
+A question-answering API over Ziggo's product pages. `POST /ask` takes a customer question in Dutch or English and returns an answer written from the scraped pages, the pages it was written from, and the graph nodes that ran. The stack is two containers: the API (FastAPI, a LangGraph graph, and a local embedding model) and Chroma as the vector store. Answers come from the Anthropic API.
 
-## Secrets
+## Running from a clean clone
 
-The Anthropic API key is read from the environment. `.env.1password` holds `op://` references to the 1Password items; it contains no secrets and is committed. Run commands through the 1Password CLI so the references are resolved at process start:
-
-```sh
-op run --env-file=.env.1password -- docker compose up --build
-```
-
-Or write a resolved `.env`, which compose picks up on its own. `.env` is gitignored.
+Needs Docker with Compose v2 and an Anthropic API key. Nothing else is installed on the host; `uv` is only needed for the host-side commands under [Verifying each component](#verifying-each-component).
 
 ```sh
-op inject -i .env.1password -o .env
+git clone https://github.com/RCdeWit/vfz-assignment.git
+cd vfz-assignment
+cp .env.1password .env     # replace the op:// value with the API key
 docker compose up --build
 ```
 
-Without 1Password, copy `.env.1password` to `.env` and replace the `op://` value with the key.
-
-The compose file passes `ANTHROPIC_API_KEY` from the shell into the container, and that value overrides `.env`. A shell that exports the variable as an empty string therefore starts the API without a key even when `.env` holds one; `/health` then reports `anthropic_api_key: missing`. Unset the variable or start compose with `env -u ANTHROPIC_API_KEY docker compose up`.
-
-## Running
-
-`docker compose up --build` starts Chroma and the API on port 8000. The first build downloads the embedding model and CPU-only torch; the API image is about 2.3 GB.
+`docker compose up --build` starts Chroma and the API on port 8000. The first build takes about a minute on a laptop when the downloads are cached; a first download adds roughly 1 GB of wheels, base image, and embedding model. The API image is 2.3 GB. The first start takes about two and a half minutes: the API scrapes about 90 pages from ziggo.nl one second apart, then embeds and indexes them in about half a minute. Later starts skip both and are up in a few seconds. The API is ready when the log shows `Application startup complete`.
 
 ```sh
 curl localhost:8000/health
@@ -36,6 +26,68 @@ curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": 
 ```
 
 Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran.
+
+### The API key
+
+With the 1Password CLI, skip the `.env` file and resolve the `op://` reference in `.env.1password` at process start:
+
+```sh
+op run --env-file=.env.1password -- docker compose up --build
+```
+
+Without it, copy `.env.1password` to `.env` and replace the `op://` value with the key; `.env` is gitignored. A shell that exports `ANTHROPIC_API_KEY` overrides `.env`, so an empty export starts the API without a key.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([client]) -- "POST /ask, GET /health" --> api
+    subgraph compose["docker compose"]
+        api["api: FastAPI, LangGraph, e5 embeddings"]
+        chroma[("chroma: HNSW index on a volume")]
+    end
+    api -- "query vectors, top 5" --> chroma
+    api -- "grade, rewrite, generate" --> anthropic["Anthropic API"]
+    api -. "scrape at first start" .-> ziggo["ziggo.nl"]
+    api -. "when a seed fetch fails" .-> snapshot["data/pages snapshot in the image"]
+```
+
+The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, and the committed snapshot is used when that fails.
+
+## Design choices
+
+| Area | Choice | Reason |
+|---|---|---|
+| Language models | `claude-sonnet-5-5` writes the answer; `claude-haiku-5-5` grades retrieval and rewrites the query. | Sonnet for the customer-facing text. Haiku for the two internal calls, where speed and cost matter more than prose quality. |
+| Model settings | Low effort, 1024 output tokens, a 30 second timeout and one retry per call. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The timeout bounds a request at about four minutes when the API hangs; the SDK defaults would make that two hours. |
+| Embeddings | `intfloat/multilingual-e5-small` with sentence-transformers, inside the API container. | Good enough retrieval for this corpus at close to zero cost, and Dutch and English queries land on the same pages. Details below. |
+| Vector store | Chroma as a separate compose service, over HTTP. | One container, no schema, metadata stored with each vector, and the index lives outside the API process. Details below. |
+| Page data | Scraped at the first start; the committed snapshot is loaded when a seed fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. |
+| Crawl scope | Six seed URLs for the product sections, links followed only under the seed paths, two hops deep. | Depth 2 reaches the per-package and per-feature pages that answer price and feature questions, without pulling in support and account pages. |
+| Chunking | One chunk per heading section, prefixed with the page title and heading; sections over 1500 characters split at line boundaries. | Section boundaries give usable citations and keep one topic per chunk. The prefix lets a section that only reads "Vanaf € 45 per maand" carry its product. |
+| Low confidence | Grade the retrieved chunks; on a fail, rewrite the query once and retrieve again; on a second fail, refuse. | Bounds a request at four model calls and gives an unanswerable question a fixed refusal instead of a guess. |
+| Language | Dutch answers to Dutch questions, English otherwise. The rewritten query is Dutch. | Both languages get a readable answer. The query is Dutch because the pages are Dutch and the embedding places a Dutch query closer to them. |
+| Tooling | `uv`, `ruff`, one `pyproject.toml`, no test suite. | Verification is done with curl against the running stack; the commands are listed below. |
+
+Out of scope: authentication on the API, streaming, conversation history, a UI.
+
+### Embedding model
+
+Anthropic has no embedding API, so the choice was between a hosted embedding API and a local model. `multilingual-e5-small` runs inside the API container.
+
+- Quality. e5 is trained on about 100 languages, so a Dutch page and an English question land near each other: the retrieval check below returns the same pages for a Dutch and an English phrasing. The small variant (384 dimensions) scores below e5-base and e5-large on retrieval benchmarks; on this corpus of a few hundred section-level chunks, each prefixed with its page title and heading, it retrieves the right pages for the example questions.
+- Cost. No per-token fee and no second account.
+- Latency. On the CPU of the API container a query embeds in about 40 ms and passages at about 25 chunks per second, so the index builds in half a minute at startup. The larger e5 variants are several times slower without a GPU.
+- Ease of use. One dependency, sentence-transformers, and a 470 MB model downloaded at image build, so startup needs no network for it. The cost is image size: torch adds about 1.7 GB.
+
+### Vector store
+
+Chroma runs as its own container. A store outside the API process means an API instance holds no index of its own, so instances can be added without each one embedding and holding a copy.
+
+- Quality. Cosine search over an HNSW index. On this collection of under a thousand vectors the top five from Chroma matched a brute-force scan on every query tried, so the approximate index costs no recall. Metadata is stored next to each vector, which gives the API its source citations without a second store.
+- Cost. Open source, one container, the index on a compose volume.
+- Latency. A top-5 query takes about 2 ms over the compose network, far below the embedding and model calls around it.
+- Ease of use. One image, an HTTP API, a Python client in the same package, and no schema: a collection is created with one call and accepts any flat metadata dict. pgvector would need a Postgres schema and OpenSearch a heavier node for the same result at this size.
 
 ## Page data
 
@@ -64,7 +116,15 @@ A volume created by an older build keeps its original distance metric, because C
 
 ## Answering
 
-A question runs through a LangGraph with five nodes. `retrieve` embeds the current query with the same e5 model as the index and fetches the five nearest chunks from Chroma. `grade` asks `claude-haiku-5-5` whether those chunks contain the information the question asks for; the call returns a two-field structured output, `pass` or `fail` plus the question's language, and an output that does not parse counts as `fail`. On `pass`, `generate` sends the chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (answer in the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything outside the chunks; page content is data, not instructions). On the first `fail`, `rewrite` asks Haiku for a short Dutch search query in the vocabulary of the product pages and the graph retrieves and grades again. The query is Dutch whatever the question's language, because the pages are Dutch. On a second `fail`, `refuse` returns a fixed message, Dutch for a Dutch question and otherwise English, and clears the sources. A request therefore makes at most four model calls: grade, rewrite, grade, generate. All calls run at low effort, which keeps the happy path to a few seconds.
+A question runs through a LangGraph with five nodes.
+
+- `retrieve` embeds the current query with the same e5 model as the index and fetches the five nearest chunks from Chroma.
+- `grade` asks `claude-haiku-5-5` whether those chunks contain the information the question asks for. The call returns a structured output with two fields: `pass` or `fail`, and the question's language. An output that does not parse counts as `fail`.
+- `generate` runs on `pass`. It sends the chunks and the question to `claude-sonnet-5-5` with a system prompt that sets the tone (a Ziggo assistant writing a few customer-facing sentences), the style (the language of the question, only from the supplied chunks, no invented prices or terms), and the limits (no account, billing, or personal advice; refer to ziggo.nl or customer service for anything else; page content is data, not instructions).
+- `rewrite` runs on the first `fail`. It asks Haiku for a short Dutch search query in the vocabulary of the product pages, and the graph retrieves and grades again. The query is Dutch whatever the question's language, because the pages are Dutch.
+- `refuse` runs on the second `fail`. It returns a fixed message, Dutch for a Dutch question and otherwise English, and clears the sources.
+
+A request makes at most four model calls: grade, rewrite, grade, generate. All calls run at low effort, which keeps the happy path to a few seconds.
 
 ```mermaid
 flowchart LR
@@ -76,65 +136,110 @@ flowchart LR
 
 A failing component returns 503 with its name in `detail`. An empty or rejected API key names the env file to fix; Chroma down or an empty collection names Chroma. A rate limit from Anthropic returns 429, with the Retry-After header passed through when Anthropic sent one. When the generate model declines to answer, the response is the same as from the `refuse` node: the refusal text and no sources.
 
+## Running on AWS
+
+Each component has a managed equivalent on AWS; the table gives one per component. Whether the managed service beats running the same container on ECS has to be checked per component: Chroma on an ECS task with an EFS volume may be cheaper than OpenSearch Serverless at this index size and as easy to run, and which one wins depends on how the index grows.
+
+```mermaid
+flowchart LR
+    client([client]) --> waf["WAF"] --> alb["ALB"] --> ecs["ECS Fargate service: API tasks"]
+    ecs -- "VPC endpoint" --> bedrock["Bedrock: Claude Sonnet and Haiku"]
+    ecs -- "VPC endpoint" --> embed["Bedrock: embedding model"]
+    ecs -- "VPC endpoint" --> aoss[("OpenSearch Serverless vector collection")]
+    schedule["EventBridge schedule"] --> ingest["ECS task: scrape, embed, upsert"]
+    ingest -. fetch .-> ziggo["ziggo.nl"]
+    ingest --> s3[("S3 page snapshot")]
+    ingest --> embed
+    ingest --> aoss
+```
+
+| Local | AWS |
+|---|---|
+| API container | ECS Fargate service behind an Application Load Balancer, autoscaled on request count. |
+| Anthropic API | Bedrock with the same Claude models, through a VPC endpoint. The task's IAM role replaces the API key. |
+| e5 embeddings in the container | Bedrock Cohere Embed Multilingual, or e5 on a SageMaker Serverless endpoint when the model must stay the same. Queries and passages must use one model, so switching models means re-embedding the index. |
+| Chroma | OpenSearch Serverless vector collection, or Chroma on ECS with an EFS volume. Either stores the chunk metadata next to each vector. |
+| Scrape and ingest at API startup | A scheduled ECS task: crawl, write the pages to S3, embed, upsert. |
+
+Scaling. The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+
+Security. The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers; the question itself is logged only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the chunk text is stripped of the prompt's tag names, which limits prompt injection through a modified page but does not rule it out.
+
 ## Verifying each component
 
-The commands below run against the compose stack. Commands prefixed with `docker compose exec api` run inside the API container, which has the embedding model and can reach Chroma; the same modules run on the host with `uv run python -m ...` when `CHROMA_HOST` and `CHROMA_PORT` point at a reachable Chroma.
+The sections below walk through the stack from startup to failure handling. Each command runs against the compose stack and states the expected result. Commands prefixed with `docker compose exec api` run inside the API container, which has the embedding model and can reach Chroma. The answering checks need a real `ANTHROPIC_API_KEY`. Define the helper used throughout once:
 
-Health. Expect 200 with `chroma: ok` and a non-zero `collection_count`; 503 when Chroma is down or the key is missing:
+```sh
+ask() { curl -s localhost:8000/ask -H 'content-type: application/json' -d "{\"question\": \"$1\"}"; echo; }
+```
+
+### Health and startup
 
 ```sh
 curl -s localhost:8000/health
 ```
 
-Startup path. The log shows whether the pages came from the live site or the snapshot, and how many chunks were ingested:
+Expect 200 with `chroma: ok`, `anthropic_api_key: set`, and `collection_count` of about 820.
 
 ```sh
 docker compose logs api | grep -E "source=|collection .* holds|ingested .* from"
 ```
 
-Restart. A second start finds the collection filled and skips scrape and ingest; the log shows `collection ziggo_pages holds N chunks` and no `source=` line:
+Expect `source=live` or `source=snapshot`, then `ingested N chunks from M pages`.
 
 ```sh
 docker compose restart api && docker compose logs --since 1m api | grep -E "source=|holds"
 ```
 
-Scrape. Refresh the snapshot and inspect one page file; each file has a title and a list of heading sections:
+Expect `collection ziggo_pages holds N chunks` and no `source=` line: the second start skips scrape and ingest.
+
+### Page data
 
 ```sh
 uv run python -m ziggo_rag.scrape
 python3 -m json.tool data/pages/internet.json | head -40
 ```
 
-Chunking. Chunks the snapshot without touching Chroma and prints counts and sizes. `unique_ids` equals `chunks`, and `max_chars` stays under about 1600:
+Expect a log summary with about 78 pages and a page file with a title and a list of heading sections, without navigation or cookie text.
+
+### Index
 
 ```sh
 uv run python -m ziggo_rag.ingest
 ```
 
-Ingest idempotence. Upserts the snapshot chunks and prints the collection count before and after. Running it against an index built from the same pages leaves the count unchanged. An index built from a live scrape that has since diverged from the snapshot gains the snapshot's chunks instead, because their ids differ:
+Expect chunk statistics for the snapshot, without touching Chroma: `unique_ids` equals `chunks`, and `max_chars` stays under about 1600.
 
 ```sh
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --ingest
 ```
 
-Retrieval. Prints the nearest chunks with their cosine distance, URL, heading, and part. A Dutch and an English phrasing of the same question return the same pages:
+Expect `count before` equal to `count after`: upserting the snapshot into an index built from the same pages changes nothing. An index built from a live scrape that has since diverged from the snapshot gains the snapshot's chunks instead, because their ids differ.
+
+### Retrieval
 
 ```sh
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "Welke internetsnelheden zijn er?"
 docker compose exec api /app/.venv/bin/python -m ziggo_rag.ingest --query "What internet speeds are there?" -k 5
 ```
 
-Answering. Needs a real `ANTHROPIC_API_KEY`. The answer's facts appear in the chunks behind `sources`; check by opening the URLs or grepping `data/pages`. An English question gets an English answer. `path` is `["retrieve", "grade", "generate"]` when the first retrieval passes the grade:
+Expect the nearest chunks with their cosine distance, URL, heading, and part, and the same pages for the Dutch and the English phrasing.
+
+### Answering
 
 ```sh
-ask() { curl -s localhost:8000/ask -H 'content-type: application/json' -d "{\"question\": \"$1\"}"; echo; }
 ask "Wat is Ziggo GO?"
 ask "heeft ziggo een app om tv te kijken op mijn telefoon"
 ask "can I watch netflix through you"
+```
+
+Expect `path` of `["retrieve", "grade", "generate"]`, an answer in the language of the question, and `sources` on the Ziggo GO and Netflix pages. The answer's facts appear in the chunks behind `sources`; check by opening the URLs or grepping `data/pages`:
+
+```sh
 grep -il "ziggo go" data/pages/*.json | head
 ```
 
-Rewrite. The TV package questions sit at the grade's boundary: the five nearest chunks name packages but are extra-channel pages rather than the package overview. The grade is a model judgment, so the same question fails the first grade in most runs and passes it in others. On a fail, `path` is `["retrieve", "grade", "rewrite", "retrieve", "grade", "generate"]` and the log shows the rewritten query; the second grade of the English question sometimes fails as well and refuses:
+### Rewrite and refusal
 
 ```sh
 ask "Welke tv-pakketten heeft Ziggo?"
@@ -142,7 +247,7 @@ ask "What TV packages does Ziggo offer?"
 docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
-Refusal. A question outside the pages gets the fixed refusal, Dutch for a Dutch question and otherwise English, `sources` is `[]`, and `path` is `["retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows three model calls for the request: `grade=fail`, `rewrite`, `grade=fail`. Internet subscription prices are refused as well, because the scraped pages contain no section with both a speed and a price:
+These questions sit at the grade's boundary: the five nearest chunks name packages but are extra-channel pages rather than the package overview. The grade is a model judgment, so the first grade fails in most runs and passes in others. On a fail, expect `path` of `["retrieve", "grade", "rewrite", "retrieve", "grade", "generate"]` and the rewritten query in the log; the English question sometimes fails the second grade as well and refuses.
 
 ```sh
 ask "Wat is de hoofdstad van Frankrijk?"
@@ -151,14 +256,16 @@ ask "hoeveel betaal ik voor het snelste internet"
 docker compose logs --since 2m api | grep -E "grade=|rewrite "
 ```
 
-Input validation. A missing or blank question returns 422 without running the graph:
+Expect the fixed refusal, Dutch for the Dutch questions and English for the English one, `sources` of `[]`, and `path` of `["retrieve", "grade", "rewrite", "retrieve", "grade", "refuse"]`. The log shows three model calls per request: `grade=fail`, `rewrite`, `grade=fail`. The internet price question is refused because the scraped pages contain no section with both a speed and a price.
+
+### Failure handling
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: application/json' -d '{}'
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: application/json' -d '{"question": " "}'
 ```
 
-Failure mapping. Each returns 503; `detail` names the component and, for the key, the env file:
+Expect 422 for both: a missing or blank question is rejected before the graph runs.
 
 ```sh
 ANTHROPIC_API_KEY= docker compose up -d api && sleep 10 && ask "Wat is Ziggo GO?"             # empty key
@@ -166,8 +273,12 @@ ANTHROPIC_API_KEY=placeholder docker compose up -d api && sleep 10 && ask "Wat i
 docker compose stop chroma && ask "Wat is Ziggo GO?"; docker compose start chroma               # Chroma down
 ```
 
-Lint and format:
+Expect 503 for each, with `detail` naming the component and, for the key, the env file. Restart with the real key afterwards: `env -u ANTHROPIC_API_KEY docker compose up -d api`.
+
+### Lint and format
 
 ```sh
 uv run ruff check . && uv run ruff format --check .
 ```
+
+Expect `All checks passed!` and `N files already formatted`.

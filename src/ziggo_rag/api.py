@@ -1,4 +1,23 @@
-"""HTTP API: POST /ask, GET /health, and startup scrape and ingest."""
+"""HTTP API: POST /ask, GET /health, and startup scrape and ingest.
+
+How the pieces connect:
+
+- Startup, in ``lifespan``, loads the embedding model, connects to Chroma at
+  the host and port from the settings, and fills the collection when no
+  previous ingest finished. Chroma down or a failed ingest is logged, not
+  raised, so the server comes up and ``/health`` reports the problem.
+- ``/ask`` validates the body, runs the compiled graph once with a fresh
+  state, and maps the final state to the response. The graph's retrieve
+  node opens its own Chroma client per call; the client is a thin HTTP
+  wrapper, so no connection is shared between startup and requests.
+- Errors. A node that cannot use Chroma or the Anthropic API raises
+  ``ComponentError``; ``/ask`` returns the status it carries (503, or 429
+  for a rate limit) with ``detail`` set to the component name and message.
+  A missing or blank question is a 422 from request validation. Any other
+  exception is a 500 from FastAPI. Missing data is not an error: when the
+  grade fails twice, the graph answers with the refusal and no sources at
+  status 200.
+"""
 
 import logging
 from contextlib import asynccontextmanager
@@ -36,6 +55,8 @@ async def lifespan(app: FastAPI):
     # pay the multi-second load.
     embedding_model()
     log.info("embedding model loaded")
+    # The vector store is connected here to check and fill the index; the
+    # graph's retrieve node connects again on each request.
     collection = startup_collection()
     if collection is not None and not is_ingested(collection):
         try:
@@ -146,9 +167,16 @@ def ask(body: AskRequest) -> AskResponse:
     env file to fix. A rate limit from Anthropic returns 429 with its
     Retry-After header when it sent one.
     """
+    # The handler is a plain def, so FastAPI runs it in a worker thread and
+    # the blocking model and Chroma calls inside the graph do not stall the
+    # event loop. The graph keeps no state between calls; each request
+    # starts from initial_state and reads the result from the final state.
     try:
         state = graph.invoke(initial_state(body.question))
     except ComponentError as e:
+        # Chroma: 503. Anthropic key empty or rejected: 503 naming the env
+        # file. Anthropic unreachable: 503. Anthropic rate limit: 429, with
+        # Retry-After passed through when Anthropic sent it.
         headers = {"Retry-After": e.retry_after} if e.retry_after else None
         raise HTTPException(
             status_code=e.status_code, detail=f"{e.component}: {e}", headers=headers
