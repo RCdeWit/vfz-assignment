@@ -4,7 +4,7 @@ A question-answering API over Ziggo's product pages. `POST /ask` takes a custome
 
 ## Running from a clean clone
 
-Needs Docker with Compose v2 and an Anthropic API key. Nothing else is installed on the host; `uv` is only needed for the host-side commands under [Verifying each component](#verifying-each-component).
+Needs Docker with Compose v2 and an Anthropic API key. The host needs nothing else; only the host-side commands under [Verifying each component](#verifying-each-component) use `uv`.
 
 ```sh
 git clone https://github.com/RCdeWit/vfz-assignment.git
@@ -25,17 +25,9 @@ Returns 200 when Chroma answers and the API key is set, else 503 with the status
 curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": "Wat is Ziggo GO?"}'
 ```
 
-Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran.
+Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the graph refuses the question. `path` lists the graph nodes that ran, in order: `["retrieve", "grade", "generate"]` when the first five chunks answer the question, with `widen` and `rewrite` rounds added when they do not. The [Answering](#answering) section describes the nodes.
 
-### The API key
-
-With the 1Password CLI, skip the `.env` file and resolve the `op://` reference in `.env.1password` at process start:
-
-```sh
-op run --env-file=.env.1password -- docker compose up --build
-```
-
-Without it, copy `.env.1password` to `.env` and replace the `op://` value with the key; `.env` is gitignored. A shell that exports `ANTHROPIC_API_KEY` overrides `.env`, so an empty export starts the API without a key.
+FastAPI serves interactive documentation at `http://localhost:8000/docs`, where you can call both endpoints from the browser and see the request and response schemas.
 
 ## Architecture
 
@@ -46,13 +38,13 @@ flowchart LR
         api["api: FastAPI, LangGraph, e5 embeddings"]
         chroma[("chroma: HNSW index on a volume")]
     end
-    api -- "query vectors, top 5" --> chroma
+    api -- "query vectors, 5 or 15 nearest chunks" --> chroma
     api -- "grade, rewrite, generate" --> anthropic["Anthropic API"]
-    api -. "scrape at first start" .-> ziggo["ziggo.nl"]
-    api -. "when a seed fetch fails" .-> snapshot["data/pages snapshot in the image"]
+    api -. "pages and price catalogue at first start" .-> ziggo["ziggo.nl"]
+    api -. "when a fetch fails" .-> snapshot["data/pages snapshot in the image"]
 ```
 
-The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, for the product pages and the price catalogue, and the committed snapshot is used when that fails.
+The API container embeds queries and passages itself, so Chroma only stores and searches vectors; a request queries it once per retrieval round, for five chunks first and 15 after a failed grade. The graph's `grade`, `rewrite`, and `generate` nodes call the Anthropic API, each call bounded by the request deadline. The API contacts ziggo.nl once, at the first start, for the product pages and the price catalogue, and loads the committed snapshot when either fetch fails.
 
 ## Design choices
 
@@ -62,12 +54,12 @@ The API container does the embedding itself, so Chroma only stores and searches 
 | Model settings | Low effort, 1024 output tokens, no SDK retries, and one 30 second deadline per request that each model call inherits as its timeout. | The answer is a few sentences composed from supplied text and the grade is a yes or no, so low effort keeps the happy path to a few seconds. The deadline returns a 504 after 30 seconds when the API hangs instead of holding the request for one timeout per call; a retry would run past the deadline. |
 | Embeddings | `intfloat/multilingual-e5-small` with sentence-transformers, inside the API container. | Good enough retrieval for this corpus at close to zero cost, and Dutch and English queries land on the same pages. Details below. |
 | Vector store | Chroma as a separate compose service, over HTTP. | One container, no schema, metadata stored with each vector, and the index lives outside the API process. Details below. |
-| Page data | Scraped at the first start, plus the JSON catalogue behind the ordering page for subscription prices; the committed snapshot is loaded when either fetch fails. | ziggo.nl sits behind bot protection, so a container can be blocked. The snapshot keeps the demo working and shows which pages the index holds. The product pages render no internet prices, in a browser either; the ordering page loads them from the catalogue, so that is the only source for them. |
+| Page data | Scraped at the first start, plus the JSON catalogue behind the ordering page for subscription prices; the API loads the committed snapshot when either fetch fails. | ziggo.nl sits behind bot protection, so it can block a container. The snapshot keeps the demo working and shows which pages the index holds. The product pages render no internet prices, not even in a browser; the ordering page loads them from the catalogue, so that is the only source for them. |
 | Crawl scope | Six seed URLs for the product sections, links followed only under the seed paths, two hops deep. | Depth 2 reaches the per-package and per-feature pages that answer price and feature questions, without pulling in support and account pages. |
 | Chunking | One chunk per heading section, prefixed with the page title and heading; sections over 1500 characters split at line boundaries. | Section boundaries give usable citations and keep one topic per chunk. The prefix lets a section that only reads "Vanaf € 45 per maand" carry its product. |
 | Low confidence | Grade the retrieved chunks; on a fail, retrieve 15 chunks instead of 5 and grade again; on a second fail, rewrite the query once and retrieve again; on a third fail, refuse. | Widening is local and costs no model call, and it covers the overview sections that rank just below the top five. Bounds a request at five model calls and gives an unanswerable question a fixed refusal instead of a guess. |
 | Language | Dutch answers to Dutch questions, English otherwise. The rewritten query is Dutch. | Both languages get a readable answer. The query is Dutch because the pages are Dutch and the embedding places a Dutch query closer to them. |
-| Tooling | `uv`, `ruff`, one `pyproject.toml`, no test suite. | Verification is done with curl against the running stack; the commands are listed below. |
+| Tooling | `uv`, `ruff`, one `pyproject.toml`, no test suite. | Verification runs curl against the running stack; the commands are below. |
 
 Out of scope: authentication on the API, streaming, conversation history, a UI.
 
@@ -84,16 +76,16 @@ Anthropic has no embedding API, so the choice was between a hosted embedding API
 
 Chroma runs as its own container. A store outside the API process means an API instance holds no index of its own, so instances can be added without each one embedding and holding a copy.
 
-- Quality. Cosine search over an HNSW index. On this collection of under a thousand vectors the top five from Chroma matched a brute-force scan on every query tried, so the approximate index costs no recall. Metadata is stored next to each vector, which gives the API its source citations without a second store.
+- Quality. Cosine search over an HNSW index. On this collection of under a thousand vectors the top five from Chroma matched a brute-force scan on every query tried, so the approximate index costs no recall. Chroma stores the metadata next to each vector, which gives the API its source citations without a second store.
 - Cost. Open source, one container, the index on a compose volume.
 - Latency. A top-5 query takes about 2 ms over the compose network, far below the embedding and model calls around it.
-- Ease of use. One image, an HTTP API, a Python client in the same package, and no schema: a collection is created with one call and accepts any flat metadata dict. pgvector would need a Postgres schema and OpenSearch a heavier node for the same result at this size.
+- Ease of use. One image, an HTTP API, a Python client in the same package, and no schema: one call creates a collection, which accepts any flat metadata dict. pgvector would need a Postgres schema and OpenSearch a heavier node for the same result at this size.
 
 ## Page data
 
-At startup the API checks the Chroma collection. When it is empty, the API scrapes the Ziggo product pages listed in `src/ziggo_rag/config.py`: each seed URL and the pages linked from it under the same path, up to `CRAWL_DEPTH` link hops away (default 2; the seeds are depth 0). Each page is reduced to its title and heading sections. The log reports every request, then a summary with page, section, and byte counts, and ends with `source=live`.
+At startup the API checks the Chroma collection. When it is empty, the API scrapes the Ziggo product pages listed in `src/ziggo_rag/config.py`: each seed URL and the pages linked from it under the same path, up to `CRAWL_DEPTH` link hops away (default 2; the seeds are depth 0). The scraper reduces each page to its title and heading sections. The log reports every request, then a summary with page, section, and byte counts, and ends with `source=live`.
 
-The product pages carry speeds and package names but no subscription prices. The prices live in the ordering page at `ziggo.nl/tv-internet`, which loads them from a JSON catalogue endpoint; a rendered browser view of `/internet` shows no prices either, only links into that page. After the crawl the API fetches that catalogue with the same request the ordering page makes and adds one page for it, with the ordering page's URL so answers cite it. The page has one overview section per product family that lists every product with its monthly price, and one section per product with the price, the promotion when there is one, and the included features. The prices are those of a 12 month contract, the default in the ordering page, and the text says so. Standalone products with a monthly binding period (Kabel TV, TV Start with a CI+ module, standalone fixed telephony) are left out because their prices belong to a different offer. The endpoint is not a public API: a change in its payload or response makes the fetch fail, and startup then falls back to the snapshot.
+The product pages carry speeds and package names but no subscription prices. The prices live in the ordering page at `ziggo.nl/tv-internet`, which loads them from a JSON catalogue endpoint; a rendered browser view of `/internet` shows no prices either, only links into that page. After the crawl the API fetches that catalogue with the same request the ordering page makes and adds one page for it, with the ordering page's URL so answers cite it. The page has one overview section per product family that lists every product with its monthly price, and one section per product with the price, the promotion when there is one, and the included features. The prices are those of a 12 month contract, the default in the ordering page, and the text says so. The page leaves out standalone products with a monthly binding period (Kabel TV, TV Start with a CI+ module, standalone fixed telephony) because their prices belong to a different offer. The endpoint is not a public API: a change in its payload or response makes the fetch fail, and startup then falls back to the snapshot.
 
 ziggo.nl sits behind bot protection, so a seed fetch can fail with a non-200 status or a timeout. The API then loads the committed snapshot in `data/pages/` and logs `source=snapshot` with the failing fetch and the crawl date from `data/pages/manifest.json`, which records when the snapshot was scraped, the seeds, the depth, and the catalogue URL. The catalogue is part of the same fallback, so the index never mixes live pages with snapshot prices. Refresh the snapshot with:
 
@@ -106,9 +98,9 @@ Each extra depth level multiplies the page count and the run time; requests are 
 
 ## Index
 
-After the pages are loaded, the API splits each heading section into a chunk, prefixed with the page title and heading so the embedding carries the product context. Sections over 1500 characters are split at line boundaries, with the prefix repeated on each part. Each chunk is embedded locally with `intfloat/multilingual-e5-small` and upserted into the Chroma collection with its vector; Chroma does not embed anything itself. The log ends with the chunk and page counts, and `/health` reports the same number as `collection_count`.
+After loading the pages, the API splits each heading section into a chunk, prefixed with the page title and heading so the embedding carries the product context. It splits sections over 1500 characters at line boundaries and repeats the prefix on each part. It embeds each chunk locally with `intfloat/multilingual-e5-small` and upserts it into the Chroma collection with its vector; Chroma does not embed anything itself. The log ends with the chunk and page counts, and `/health` reports the same number as `collection_count`.
 
-Chunk ids are a hash of the page URL, heading, and part number, so ingesting the same pages again leaves the collection unchanged. When the last batch is written, the API stamps the collection metadata with `ingested_at`. Startup skips scrape and ingest only when that stamp is present, so a start that was interrupted halfway through is retried on the next one, and `docker compose restart api` reuses a finished index. Ingest never deletes chunks: a section that was renamed or removed since the index was built stays in it until the index is rebuilt. To rebuild from scratch, drop the Chroma volume:
+Chunk ids are a hash of the page URL, heading, and part number, so ingesting the same pages again leaves the collection unchanged. After the last batch, the API stamps the collection metadata with `ingested_at`. Startup skips scrape and ingest only when that stamp is present, so the next start retries a start that was interrupted halfway through, and `docker compose restart api` reuses a finished index. Ingest never deletes chunks: a section that was renamed or removed since the index was built stays in it until the index is rebuilt. To rebuild from scratch, drop the Chroma volume:
 
 ```sh
 docker compose down -v && docker compose up --build
@@ -144,7 +136,7 @@ Each request has a deadline of 30 seconds, set by `REQUEST_TIMEOUT`. The API pas
 
 ## Running on AWS
 
-Each component has a managed equivalent on AWS; the table gives one per component. Whether the managed service beats running the same container on ECS has to be checked per component: Chroma on an ECS task with an EFS volume may be cheaper than OpenSearch Serverless at this index size and as easy to run, and which one wins depends on how the index grows.
+Each component has a managed equivalent on AWS; the table gives one per component. Whether the managed service beats running the same container on ECS needs a check per component: Chroma on an ECS task with an EFS volume may be cheaper than OpenSearch Serverless at this index size and as easy to run, and which one wins depends on how the index grows.
 
 ```mermaid
 flowchart LR
@@ -179,9 +171,13 @@ flowchart LR
 | Chroma | OpenSearch Serverless vector collection, or Chroma on ECS with an EFS volume. Either stores the chunk metadata next to each vector. |
 | Scrape and ingest at API startup | A scheduled ECS task: crawl, write the pages to S3, embed, upsert. |
 
-Scaling. The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+### Scaling
 
-Security. The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers; the question itself is logged only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the chunk text is stripped of the prompt's tag names, which limits prompt injection through a modified page but does not rule it out.
+The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+
+### Security
+
+The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers and logs the question itself only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the graph strips the prompt's tag names from the chunk text, which limits prompt injection through a modified page but does not rule it out.
 
 ## Verifying each component
 
@@ -298,7 +294,7 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: ap
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/ask -H 'content-type: application/json' -d '{"question": " "}'
 ```
 
-Expect 422 for both: a missing or blank question is rejected before the graph runs.
+Expect 422 for both: request validation rejects a missing or blank question before the graph runs.
 
 ```sh
 ANTHROPIC_API_KEY= docker compose up -d api && sleep 10 && ask "Wat is Ziggo GO?"             # empty key
@@ -314,7 +310,7 @@ sleep 15 && curl -s -w '\n%{http_code} after %{time_total}s\n' localhost:8001/as
 docker stop $(docker ps -q --filter name=vfz-assignment-api-run)
 ```
 
-This starts a second API container on port 8001 whose Anthropic calls go to an unroutable address, with the deadline lowered to 5 seconds. Expect `{"detail":"timeout: The request did not finish within 5 seconds."}` and `504 after 5.0s`: the first grade call is given the 5 seconds left and times out at the deadline.
+This starts a second API container on port 8001 whose Anthropic calls go to an unroutable address, with the deadline lowered to 5 seconds. Expect `{"detail":"timeout: The request did not finish within 5 seconds."}` and `504 after 5.0s`: the first grade call gets the 5 seconds left and times out at the deadline.
 
 ### Lint and format
 
