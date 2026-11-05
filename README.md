@@ -25,17 +25,9 @@ Returns 200 when Chroma answers and the API key is set, else 503 with the status
 curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question": "Wat is Ziggo GO?"}'
 ```
 
-Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran.
+Returns `{"answer", "sources", "path"}`. `sources` lists the pages and headings the answer was written from, as `{"url", "title", "heading"}` in retrieval order; it is empty when the question is refused. `path` lists the graph nodes that ran, in order: `["retrieve", "grade", "generate"]` when the first five chunks answer the question, with `widen` and `rewrite` rounds added when they do not. The [Answering](#answering) section describes the nodes.
 
-### The API key
-
-With the 1Password CLI, skip the `.env` file and resolve the `op://` reference in `.env.1password` at process start:
-
-```sh
-op run --env-file=.env.1password -- docker compose up --build
-```
-
-Without it, copy `.env.1password` to `.env` and replace the `op://` value with the key; `.env` is gitignored. A shell that exports `ANTHROPIC_API_KEY` overrides `.env`, so an empty export starts the API without a key.
+FastAPI serves interactive documentation at `http://localhost:8000/docs`, where both endpoints can be called from the browser with the request and response schemas shown.
 
 ## Architecture
 
@@ -46,13 +38,13 @@ flowchart LR
         api["api: FastAPI, LangGraph, e5 embeddings"]
         chroma[("chroma: HNSW index on a volume")]
     end
-    api -- "query vectors, top 5" --> chroma
+    api -- "query vectors, 5 or 15 nearest chunks" --> chroma
     api -- "grade, rewrite, generate" --> anthropic["Anthropic API"]
-    api -. "scrape at first start" .-> ziggo["ziggo.nl"]
-    api -. "when a seed fetch fails" .-> snapshot["data/pages snapshot in the image"]
+    api -. "pages and price catalogue at first start" .-> ziggo["ziggo.nl"]
+    api -. "when a fetch fails" .-> snapshot["data/pages snapshot in the image"]
 ```
 
-The API container does the embedding itself, so Chroma only stores and searches vectors. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes. ziggo.nl is contacted once, at the first start, for the product pages and the price catalogue, and the committed snapshot is used when that fails.
+The API container embeds queries and passages itself, so Chroma only stores and searches vectors; a request queries it once per retrieval round, for five chunks first and 15 after a failed grade. The Anthropic API is called from the graph's `grade`, `rewrite`, and `generate` nodes, each call bounded by the request deadline. ziggo.nl is contacted once, at the first start, for the product pages and the price catalogue, and the committed snapshot is used when either fetch fails.
 
 ## Design choices
 
@@ -179,9 +171,13 @@ flowchart LR
 | Chroma | OpenSearch Serverless vector collection, or Chroma on ECS with an EFS volume. Either stores the chunk metadata next to each vector. |
 | Scrape and ingest at API startup | A scheduled ECS task: crawl, write the pages to S3, embed, upsert. |
 
-Scaling. The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+### Scaling
 
-Security. The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers; the question itself is logged only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the chunk text is stripped of the prompt's tag names, which limits prompt injection through a modified page but does not rule it out.
+The API holds no state between requests, so the Fargate task count scales horizontally. Bedrock and OpenSearch Serverless scale on their own, with the per-account quotas as the limit. Ingest has to leave the API startup path: with several tasks, each one would scrape and re-embed the same pages at every deploy, and a task restarted during ingest would serve a partial index. The scheduled task writes one index that all API tasks read.
+
+### Security
+
+The tasks run in private subnets and reach Bedrock, OpenSearch, and S3 through VPC endpoints; only the ingest task reaches the internet, through a NAT gateway, to fetch ziggo.nl. WAF on the load balancer rate-limits per client. The API logs no customer identifiers; the question itself is logged only at the rewrite step. Scraped page content is untrusted input: the system prompt tells the model to treat it as data and the chunk text is stripped of the prompt's tag names, which limits prompt injection through a modified page but does not rule it out.
 
 ## Verifying each component
 
